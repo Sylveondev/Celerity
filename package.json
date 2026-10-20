@@ -1,0 +1,107 @@
+{
+  "name": "celerity",
+  "productName": "Celerity",
+  "version": "0.1.0",
+  "description": "A fast, free 2D animation studio compatible with Adobe Animate .fla files. Exports SWF, video, GIF, PNG sequences, SVG and sprite sheets.",
+  "main": "dist/main.js",
+  "author": {
+    "name": "Sylveondev"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/Sylveondev/Celerity",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sylveondev/Celerity.git"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "build:prod": "node build.mjs --prod",
+    "watch": "node build.mjs --watch",
+    "start": "node build.mjs && electron .",
+    "dev": "node build.mjs && electron . --enable-logging",
+    "web": "node build.mjs && node scripts/serve.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "tsx --test tests/*.test.ts",
+    "dist": "node build.mjs --prod && electron-builder",
+    "dist:mac": "node build.mjs --prod && electron-builder --mac",
+    "dist:win": "node build.mjs --prod && electron-builder --win",
+    "dist:linux": "node build.mjs --prod && electron-builder --linux"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  },
+  "build": {
+    "appId": "app.celerity.studio",
+    "productName": "Celerity",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/**/*.map",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
+    ],
+    "fileAssociations": [
+      {
+        "ext": "fla",
+        "name": "Animate Document",
+        "description": "Animate Document",
+        "role": "Editor"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.graphics-design",
+      "identity": "-",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "darkModeSupport": true
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-Setup-${version}-win-${arch}.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb",
+        "zip"
+      ],
+      "category": "Graphics",
+      "maintainer": "Sylveondev",
+      "synopsis": "2D animation studio compatible with Animate .fla files"
+    },
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "dmg": {
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
+    },
+    "deb": {
+      "artifactName": "${productName}-${version}-linux-${arch}.${ext}"
+    },
+    "publish": null
+  }
+}
