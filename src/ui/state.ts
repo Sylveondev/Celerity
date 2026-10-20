@@ -48,6 +48,7 @@ export interface UIState {
   swatches: string[];
   recentColors: string[];
   previewQuality: 'high' | 'fast';
+  objectDrawing: boolean;
 }
 
 const DEFAULT_SWATCHES = (() => {
@@ -101,6 +102,7 @@ export const ui: UIState = {
   swatches: DEFAULT_SWATCHES,
   recentColors: [],
   previewQuality: 'high',
+  objectDrawing: false,
 };
 
 export const store = new Store();
@@ -117,7 +119,7 @@ export function setUI<K extends keyof UIState>(key: K, value: UIState[K]) {
 const PREF_KEYS: (keyof UIState)[] = [
   'fillColor', 'fillAlpha', 'fillKind', 'fillStops', 'strokeColor', 'strokeAlpha', 'strokeWidth', 'rectRadius', 'polySides', 'polyStar', 'polyInner',
   'pencilMode', 'brushSize', 'brushPressure', 'eraserSize', 'eraserMode', 'bucketGap', 'textFont', 'textSize', 'onionBefore', 'onionAfter',
-  'loop', 'snap', 'showGrid', 'recentColors', 'previewQuality', 'clipToStage',
+  'loop', 'snap', 'showGrid', 'recentColors', 'previewQuality', 'clipToStage', 'objectDrawing',
 ];
 
 let persistTimer = 0;

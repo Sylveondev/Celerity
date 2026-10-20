@@ -1,3 +1,5 @@
+import { planarFromPaths, planarToPaths } from './planar';
+import { motionTween, newMotion, splitMotion } from './motion';
 import type { Element, Frame, Layer, Timeline } from './types';
 import { cloneElements, emptyFrame } from './util';
 import { classicTween, classicTweenValid, shapeTween, shapeTweenValid } from './tween';
@@ -46,6 +48,10 @@ export function resolveLayerFrame(layer: Layer, f: number): ResolvedFrame | null
   const frame = layer.frames[i];
   const next = layer.frames[i + 1];
   const offset = f - frame.start;
+  if (frame.tween === 'motion' && frame.motion && frame.elements.length) {
+    // object-based tweens animate on their own (no end keyframe needed); every frame is "tweened"
+    return { frame, next, offset, elements: motionTween(frame, offset), tweened: true };
+  }
   if (offset === 0 || frame.tween === 'none' || !next) {
     return { frame, next, offset, elements: frame.elements, tweened: false };
   }
@@ -136,6 +142,12 @@ export function insertKeyframe(layer: Layer, f: number, blank: boolean): Frame {
     if (f < cells.length) {
       const resolved = resolveLayerFrame(layer, f);
       content = resolved ? structuredClone(resolved.elements) : [];
+      // in-betweens of raw-shape tweens become editable raw shapes again
+      content = content.map((e) => {
+        if (e.type !== 'shape' || !e.fromRaw) return e;
+        const planar = planarFromPaths(e.paths);
+        return { type: 'shape', id: e.id, matrix: e.matrix, planar, paths: planarToPaths(planar) };
+      });
     } else {
       const last = cells[cells.length - 1];
       content = last ? structuredClone(last.elements) : [];
@@ -147,6 +159,12 @@ export function insertKeyframe(layer: Layer, f: number, blank: boolean): Frame {
   if (prev && !blank && f < cells.length) {
     // the new keyframe continues the tween settings of the span it split
     nf.tween = prev.tween; nf.ease = prev.ease; nf.rotate = prev.rotate; nf.rotateTimes = prev.rotateTimes;
+    if (prev.tween === 'motion' && prev.motion) {
+      const at = f - prev.start;
+      nf.motion = splitMotion(prev.motion, at);
+      // the stored object is the state at the split, with its colour as authored
+      if (nf.elements[0] && prev.elements[0] && nf.elements[0].type === 'symbol' && prev.elements[0].type === 'symbol') nf.elements[0] = { ...nf.elements[0], matrix: nf.elements[0].matrix, color: prev.elements[0].color };
+    } else if (prev.tween === 'motion') nf.tween = 'none';
   }
   if (f >= cells.length) {
     const last = cells[cells.length - 1] ?? null;
@@ -196,6 +214,8 @@ export function setTween(layer: Layer, f0: number, f1: number, tween: Frame['twe
     if (fr && !seen.has(fr)) {
       seen.add(fr);
       fr.tween = tween;
+      if (tween === 'motion') fr.motion ??= newMotion();
+      else delete fr.motion;
     }
   }
 }

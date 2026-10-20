@@ -1,5 +1,9 @@
 // New / Open / Save / Import, crash recovery.
-import type { BitmapItem, Doc, Element } from '../core/types';
+import type { BitmapItem, Doc, Element, SoundItem, VideoItem } from '../core/types';
+import { sniffAudio } from '../core/sound';
+import { sniffVideo } from '../io/flv';
+import { addSoundFile, attachSound } from './audio';
+import { addVideoFile, placeVideo } from './video';
 import { newDoc, itemId, uniqueName, uid } from '../core/util';
 import { AssetStore, sniffMime } from '../core/assets';
 import { readFla, type ReadResult } from '../io/xfl-read';
@@ -14,6 +18,8 @@ import type { Stage } from './stage';
 
 export const FLA_FILTER = [{ name: 'Animate Document', extensions: ['fla'] }];
 const IMAGE_EXT = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
+const AUDIO_EXT = ['mp3', 'wav', 'ogg', 'oga', 'flac', 'm4a', 'aac', 'aif', 'aiff'];
+const VIDEO_EXT = ['flv', 'mp4', 'm4v', 'mov', 'webm', 'avi'];
 
 let stageRef: Stage | null = null;
 export function bindStage(s: Stage) { stageRef = s; }
@@ -175,10 +181,24 @@ export async function importFiles(files: OpenedFile[], toStage: boolean, at?: { 
   const placed: Element[] = [];
   const items: BitmapItem[] = [];
   const svgEls: Element[] = [];
+  const media: (SoundItem | VideoItem)[] = [];
   for (const f of files) {
     const ext = f.name.split('.').pop()?.toLowerCase() ?? '';
     try {
       if (ext === 'fla') { await importLibraryFrom(f); continue; }
+      const audioExt = AUDIO_EXT.includes(ext);
+      if (audioExt || (!VIDEO_EXT.includes(ext) && sniffAudio(f.data) && !sniffVideo(f.data))) {
+        const s = await addSoundFile(f.name, f.data);
+        if (s) { media.push(s); continue; }
+        toast(`Could not decode the sound ${f.name}`, 'error');
+        continue;
+      }
+      if (VIDEO_EXT.includes(ext) || sniffVideo(f.data)) {
+        const v = await addVideoFile(f.name, f.data);
+        if (v) { media.push(v); continue; }
+        toast(`Could not read the video ${f.name}`, 'error');
+        continue;
+      }
       if (ext === 'svg') {
         const r = importSvg(new TextDecoder().decode(f.data));
         if (r.elements.length) svgEls.push(r.elements.length === 1 ? r.elements[0] : { type: 'group', id: uid(), matrix: translate(0, 0), children: r.elements });
@@ -190,6 +210,17 @@ export async function importFiles(files: OpenedFile[], toStage: boolean, at?: { 
     } catch (e) {
       toast(`Could not import ${f.name}: ${(e as Error).message}`, 'error', 5000);
     }
+  }
+  if (media.length) {
+    store.transact('Import', () => { for (const m of media) store.addLibraryItem(m); });
+    if (toStage && store.canDraw()) {
+      const center = at ?? stageRef?.viewCenter() ?? { x: store.doc.width / 2, y: store.doc.height / 2 };
+      for (const m of media) {
+        if (m.kind === 'sound') attachSound(m.name);
+        else placeVideo(m.name, center.x, center.y);
+      }
+    }
+    if (!items.length && !svgEls.length) { toast(`Imported ${media.length} item(s)`, 'ok', 1500); return; }
   }
   if (!items.length && !svgEls.length) return;
   if (toStage && !store.canDraw()) toStage = false;
@@ -214,8 +245,10 @@ export async function importFiles(files: OpenedFile[], toStage: boolean, at?: { 
 
 export async function importDialog(toStage: boolean) {
   const files = await platform.openFiles([
-    { name: 'All Supported', extensions: [...IMAGE_EXT, 'fla'] },
+    { name: 'All Supported', extensions: [...IMAGE_EXT, ...AUDIO_EXT, ...VIDEO_EXT, 'fla'] },
     { name: 'Images', extensions: IMAGE_EXT.filter((e) => e !== 'svg') },
+    { name: 'Sound', extensions: AUDIO_EXT },
+    { name: 'Video', extensions: VIDEO_EXT },
     { name: 'SVG', extensions: ['svg'] },
     { name: 'Animate Document (library)', extensions: ['fla'] },
   ], true, toStage ? 'Import to Stage' : 'Import to Library');
@@ -230,8 +263,8 @@ export async function importLibraryFrom(f: OpenedFile) {
     for (const it of result.doc.library) {
       if (store.lib.has(it.name)) continue;
       const copy = structuredClone(it);
-      if (copy.kind === 'bitmap') {
-        const a = assets.get(it.kind === 'bitmap' ? it.assetId : '');
+      if (copy.kind === 'bitmap' || copy.kind === 'sound' || copy.kind === 'video') {
+        const a = assets.get('assetId' in it ? it.assetId : '');
         if (a) copy.assetId = store.assets.adopt(a).id;
       }
       store.addLibraryItem(copy);

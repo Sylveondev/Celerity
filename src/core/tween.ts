@@ -305,6 +305,7 @@ export function shapeTween(fa: Frame, fb: Frame, t: number, id: string): Element
     }
   }
   const shape: ShapeElement = { type: 'shape', id, matrix: { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 }, paths };
+  if (fa.elements.some((e) => e.type === 'shape' && e.planar)) shape.fromRaw = true;
   return [...others, shape];
 }
 

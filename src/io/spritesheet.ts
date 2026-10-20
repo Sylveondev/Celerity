@@ -10,6 +10,8 @@ export interface SheetFrame {
   hash: string;                          // pixel hash for duplicate detection
   dupOf?: number;                        // index of identical frame
   x?: number; y?: number;                // placement in the sheet
+  anim?: string;                         // animation (symbol) the frame belongs to
+  reg?: { x: number; y: number };        // registration point when it differs per animation
 }
 
 export type SheetAlgorithm = 'basic' | 'packed';
@@ -147,6 +149,17 @@ export interface SheetMeta {
   registration: { x: number; y: number }; // registration point in untrimmed frame
 }
 
+/** Animations in frame order: [name, first index, last index]. One per symbol on multi-symbol sheets. */
+export function sheetAnimations(frames: SheetFrame[], fallback: string): [string, number, number][] {
+  const out: [string, number, number][] = [];
+  frames.forEach((f, i) => {
+    const n = f.anim ?? fallback;
+    const last = out[out.length - 1];
+    if (last && last[0] === n && last[2] === i - 1) last[2] = i; else out.push([n, i, i]);
+  });
+  return out;
+}
+
 function xmlEsc(s: string) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
 
 export function sheetData(format: SheetFormat, frames: SheetFrame[], meta: SheetMeta): { text: string; ext: string } {
@@ -165,7 +178,7 @@ export function sheetData(format: SheetFormat, frames: SheetFrame[], meta: Sheet
       const metaObj = {
         app, version: '1.0', image: meta.image, format: 'RGBA8888',
         size: { w: meta.width, h: meta.height }, scale: String(meta.scale),
-        frameTags: [], frameRate: meta.fps,
+        frameTags: sheetAnimations(frames, meta.animationName).map(([name, from, to]) => ({ name, from, to, direction: 'forward' })), frameRate: meta.fps,
       };
       if (format === 'json-array') return { ext: 'json', text: JSON.stringify({ frames: entries, meta: metaObj }, null, 2) };
       const hash: Record<string, unknown> = {};
@@ -184,7 +197,7 @@ export function sheetData(format: SheetFormat, frames: SheetFrame[], meta: Sheet
               frame: { x: f.x, y: f.y, w: f.w, h: f.h },
             })),
           }],
-          meta: { app, version: '1.0' },
+          meta: { app, version: '1.0', frameTags: sheetAnimations(frames, meta.animationName).map(([name, from, to]) => ({ name, from, to, direction: 'forward' })) },
         }, null, 2),
       };
     }
@@ -197,14 +210,12 @@ export function sheetData(format: SheetFormat, frames: SheetFrame[], meta: Sheet
       return { ext: 'xml', text: `<?xml version="1.0" encoding="UTF-8"?>\n<!-- Created with ${app} -->\n<TextureAtlas imagePath="${xmlEsc(meta.image)}">\n${lines.join('\n')}\n</TextureAtlas>\n` };
     }
     case 'easeljs': {
-      const arr = frames.map((f) => [f.x, f.y, f.w, f.h, 0, Math.round(meta.registration.x - f.trimX), Math.round(meta.registration.y - f.trimY)]);
-      return {
-        ext: 'json',
-        text: JSON.stringify({
-          images: [meta.image], framerate: meta.fps, frames: arr,
-          animations: { [meta.animationName]: { frames: frames.map((_, i) => i) } },
-        }, null, 2),
-      };
+      const arr = frames.map((f) => { const r = f.reg ?? meta.registration; return [f.x, f.y, f.w, f.h, 0, Math.round(r.x - f.trimX), Math.round(r.y - f.trimY)]; });
+      const animations: Record<string, { frames: number[] }> = {};
+      for (const [name, from, to] of sheetAnimations(frames, meta.animationName)) {
+        (animations[name] ??= { frames: [] }).frames.push(...Array.from({ length: to - from + 1 }, (_, k) => from + k));
+      }
+      return { ext: 'json', text: JSON.stringify({ images: [meta.image], framerate: meta.fps, frames: arr, animations }, null, 2) };
     }
     case 'cocos2d': {
       const items = frames.map((f) => {
@@ -218,7 +229,8 @@ export function sheetData(format: SheetFormat, frames: SheetFrame[], meta: Sheet
       };
     }
     case 'css': {
-      const lines = frames.map((f, i) => `.${meta.animationName}-${i} { width: ${f.srcW}px; height: ${f.srcH}px; background: url("${meta.image}") ${-(f.x ?? 0) + f.trimX}px ${-(f.y ?? 0) + f.trimY}px no-repeat; }`);
+      const idx = new Map<string, number>();
+      const lines = frames.map((f) => { const a = f.anim ?? meta.animationName; const i = idx.get(a) ?? 0; idx.set(a, i + 1); return `.${a.replace(/[^\w-]+/g, '_')}-${i} {`; }).map((head, k) => { const f = frames[k]; return `${head} width: ${f.srcW}px; height: ${f.srcH}px; background: url("${meta.image}") ${-(f.x ?? 0) + f.trimX}px ${-(f.y ?? 0) + f.trimY}px no-repeat; }`; });
       return { ext: 'css', text: `/* ${app} sprite sheet: ${meta.image} */\n${lines.join('\n')}\n` };
     }
   }

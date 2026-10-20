@@ -6,7 +6,7 @@ import { TimelinePanel } from './timeline-panel';
 import { PropertiesPanel, documentSettingsDialog } from './props-panel';
 import { LibraryPanel, newSymbolDialog, DRAG_MIME } from './library-panel';
 import { ColorPanel, AlignPanel, TransformPanel } from './side-panels';
-import { h, clear, isTextInput, toast, checkbox, numField } from './dom';
+import { h, clear, isTextInput, toast, checkbox, numField, select } from './dom';
 import { icon } from './icons';
 import { dropdown, closeMenus, menusOpen, shortcutLabel, contextMenu, type MenuItem, SEP } from './menu';
 import { modal, isModalOpen, row, promptDialog, confirmDialog } from './dialogs';
@@ -18,6 +18,7 @@ import { platform, isElectron, isMac } from './platform';
 import { timelineFrameCount } from '../core/timeline';
 import { newTimeline, uniqueName, baseName } from '../core/util';
 import { apply, invert } from '../core/matrix';
+import { Workspace, type PanelId } from './workspace';
 
 export interface Command {
   id: string;
@@ -43,8 +44,6 @@ export class App {
   private editBar!: HTMLElement;
   private statusEl!: HTMLElement;
   private titleEl!: HTMLElement;
-  private rightTop!: HTMLElement;
-  private rightBottom!: HTMLElement;
 
   start(host: HTMLElement) {
     loadPrefs();
@@ -96,6 +95,7 @@ export class App {
     c('file.exportMedia', 'Export Video / Media…', () => X.exportMediaDialog('mp4'), 'Mod+Alt+Shift+S');
     c('file.exportGif', 'Export Animated GIF…', () => X.exportMediaDialog('gif'), 'Mod+Alt+Shift+G');
     c('file.exportPng', 'Export PNG Sequence…', () => X.exportMediaDialog('png-seq'));
+    c('file.exportSymbols', 'Export Selected Symbols…', () => X.exportSymbolsDialog(this.selectedSymbolNames()));
     c('file.spriteSheet', 'Generate Sprite Sheet…', () => X.exportSpriteSheetDialog(this.library.selected.size === 1 && store.lib.get([...this.library.selected][0])?.kind === 'symbol' ? [...this.library.selected][0] : undefined), 'Mod+Alt+Shift+P');
     c('file.publishSettings', 'Publish Settings…', () => X.publishDialog(), 'Mod+Shift+F12');
     c('file.publish', 'Publish (SWF + HTML)', () => X.publishSwf(), 'Shift+F12');
@@ -138,6 +138,7 @@ export class App {
     c('insert.scene', 'Scene', () => this.addScene());
     c('insert.classicTween', 'Create Classic Tween', () => A.createTween('classic'));
     c('insert.shapeTween', 'Create Shape Tween', () => A.createTween('shape'));
+    c('insert.motionTween', 'Create Motion Tween', () => A.createTween('motion'));
     c('timeline.removeTween', 'Remove Tween', () => A.createTween('none'));
     c('timeline.frame', 'Insert Frame', () => A.insertFrame(), 'F5');
     c('timeline.removeFrames', 'Remove Frames', () => A.removeFramesCmd(), 'Shift+F5');
@@ -185,13 +186,15 @@ export class App {
     c('control.test', 'Test Movie', () => X.testMovie(), 'Mod+Enter');
     c('control.loop', 'Loop Playback', () => setUI('loop', !ui.loop), undefined, { checked: () => ui.loop });
     // window
-    c('window.timeline', 'Timeline', () => this.togglePanel('timeline'), 'Mod+Alt+T', { checked: () => !this.root.classList.contains('no-timeline') });
-    c('window.properties', 'Properties', () => this.showTab('properties'), 'Mod+F3');
-    c('window.library', 'Library', () => this.showTab('library'), 'Mod+L');
-    c('window.color', 'Color', () => this.showTab('color'), 'Mod+Shift+F9');
-    c('window.align', 'Align', () => this.showTab('align'), 'Mod+K');
-    c('window.transform', 'Transform', () => this.showTab('transform'), 'Mod+T');
-    c('window.tools', 'Tools', () => this.togglePanel('tools'), 'Mod+F2', { checked: () => !this.root.classList.contains('no-tools') });
+    const panel = (id: PanelId, label: string, sc?: string) => c(`window.${id}`, label, () => this.togglePanel(id), sc, { checked: () => this.workspace?.isVisible(id) ?? true });
+    panel('timeline', 'Timeline', 'Mod+Alt+T');
+    panel('properties', 'Properties', 'Mod+F3');
+    panel('library', 'Library', 'Mod+L');
+    panel('color', 'Color', 'Mod+Shift+F9');
+    panel('align', 'Align', 'Mod+K');
+    panel('transform', 'Transform', 'Mod+T');
+    panel('tools', 'Tools', 'Mod+F2');
+    c('window.resetWorkspace', 'Reset Workspace', () => this.workspace.reset());
     c('window.fullscreen', 'Toggle Full Screen', () => { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => {}); }, 'F11');
     // help
     c('help.shortcuts', 'Keyboard Shortcuts', () => this.shortcutsDialog(), 'F1');
@@ -200,6 +203,7 @@ export class App {
     for (const t of TOOL_LIST) if (t.key) c(`tool.${t.id}`, t.name, () => this.setTool(t.id), t.key);
     c('tool.polystarAlt', 'PolyStar Tool', () => this.setTool('polystar'), 'Shift+R');
     c('tool.swapColors', 'Swap Colors', () => this.swapColors(), 'X');
+    c('tool.objectDrawing', 'Object Drawing', () => { setUI('objectDrawing', !ui.objectDrawing); store.flash(ui.objectDrawing ? 'Object Drawing on: new shapes are separate drawing objects.' : 'Object Drawing off: shapes on the same layer merge.'); }, 'J', { checked: () => ui.objectDrawing });
     c('tool.defaultColors', 'Default Colors', () => this.defaultColors(), 'D');
     c('scene.prev', 'Previous Scene', () => store.setScene(store.sceneIndex - 1), 'PageUp', { enabled: () => store.sceneIndex > 0 });
     c('scene.next', 'Next Scene', () => store.setScene(store.sceneIndex + 1), 'PageDown', { enabled: () => store.sceneIndex < store.doc.scenes.length - 1 });
@@ -211,6 +215,15 @@ export class App {
   }
 
   alignToStage = false;
+
+  /** Symbols chosen in the library, or the symbols of the instances selected on stage. */
+  selectedSymbolNames(): string[] {
+    const fromLib = [...this.library.selected].filter((n) => store.lib.get(n)?.kind === 'symbol');
+    if (fromLib.length) return fromLib;
+    const names = new Set<string>();
+    for (const s of store.selected()) if (s.el.type === 'symbol') names.add(s.el.libraryItem);
+    return [...names];
+  }
 
   run(id: string) {
     const c = this.commands.get(id);
@@ -234,7 +247,7 @@ export class App {
         { label: 'Open Recent', submenu: [] },
         i('file.close'), SEP, i('file.save'), i('file.saveAs'), i('file.revert'), SEP,
         { label: 'Import', submenu: [i('file.importStage'), i('file.importLibrary'), i('file.openLibrary')] },
-        { label: 'Export', submenu: [i('file.exportImage'), i('file.exportMedia'), i('file.exportGif'), i('file.exportPng'), SEP, i('file.spriteSheet')] },
+        { label: 'Export', submenu: [i('file.exportImage'), i('file.exportMedia'), i('file.exportGif'), i('file.exportPng'), SEP, i('file.spriteSheet'), i('file.exportSymbols')] },
         SEP, i('file.publishSettings'), i('file.publish'), ...(isElectron && !isMac ? [SEP, i('file.quit')] : []),
       ]],
       ['Edit', () => [
@@ -247,12 +260,12 @@ export class App {
       ['View', () => [
         i('view.zoomIn'), i('view.zoomOut'),
         { label: 'Magnification', submenu: [i('view.zoom100'), i('view.fit'), i('view.zoom400'), i('view.zoom800'), i('view.center')] },
-        SEP, i('view.grid'), i('view.snap'), i('view.clip'), i('view.onion'),
+        SEP, i('view.grid'), i('view.snap'), i('view.clip'), i('view.onion'), SEP, i('tool.objectDrawing'),
       ]],
       ['Insert', () => [
         i('insert.newSymbol'), SEP,
         { label: 'Timeline', submenu: [i('insert.layer'), i('insert.folder'), SEP, i('timeline.frame'), i('timeline.keyframe'), i('timeline.blankKeyframe')] },
-        i('insert.classicTween'), i('insert.shapeTween'), i('timeline.removeTween'), SEP, i('insert.scene'),
+        i('insert.motionTween'), i('insert.shapeTween'), i('insert.classicTween'), i('timeline.removeTween'), SEP, i('insert.scene'),
       ]],
       ['Modify', () => [
         i('modify.document'), SEP, i('modify.convertSymbol'), i('modify.breakApart'), SEP,
@@ -269,7 +282,7 @@ export class App {
       ]],
       ['Window', () => [
         i('window.timeline'), i('window.tools'), SEP, i('window.properties'), i('window.library'), i('window.color'), i('window.align'), i('window.transform'), SEP,
-        { label: 'Reset Workspace', action: () => this.resetWorkspace() }, i('window.fullscreen'),
+        { label: 'Workspaces', submenu: this.workspaceMenu() }, i('window.resetWorkspace'), SEP, i('window.fullscreen'),
       ]],
       ['Help', () => [i('help.shortcuts'), SEP, i('help.about')]],
     ];
@@ -299,7 +312,10 @@ export class App {
     }
     this.statusEl = h('span', { class: 'menubar-status' });
     this.titleEl = h('span', { class: 'doc-title' });
-    menubar.append(h('span', { class: 'menubar-spacer' }), this.titleEl, h('span', { class: 'menubar-spacer' }), this.statusEl);
+    const wsBtn = h('button', { class: 'ws-switch', title: 'Workspace' });
+    wsBtn.addEventListener('click', () => dropdown(this.workspaceMenu(), wsBtn));
+    this.wsBtn = wsBtn;
+    menubar.append(h('span', { class: 'menubar-spacer' }), this.titleEl, h('span', { class: 'menubar-spacer' }), this.statusEl, wsBtn);
 
     // tools
     const toolbar = h('div', { class: 'toolbar' });
@@ -321,107 +337,95 @@ export class App {
     const snapBtn = h('button', { class: `icon-btn tiny toggle ${ui.snap ? 'on' : ''}`, title: 'Snap to objects', html: icon('snap') });
     snapBtn.addEventListener('click', () => setUI('snap', !ui.snap));
     onUI((k) => { if (k === 'snap') snapBtn.classList.toggle('on', ui.snap); });
+    const odBtn = h('button', { class: `icon-btn tiny toggle ${ui.objectDrawing ? 'on' : ''}`, title: 'Object Drawing (J): off = shapes merge on the layer, like Animate\'s default', html: icon('objectDraw') });
+    odBtn.addEventListener('click', () => this.run('tool.objectDrawing'));
+    onUI((k) => { if (k === 'objectDrawing') odBtn.classList.toggle('on', ui.objectDrawing); });
     toolbar.append(h('div', { class: 'tool-colors' }, h('div', { class: 'sw-stack' }, strokeSw, fillSw),
       h('div', { class: 'sw-mini' }, mini('reset', 'Black and white (D)', () => this.defaultColors()), mini('swap', 'Swap colors (X)', () => this.swapColors()), mini('noColor', 'No color', () => setUI('fillNone', !ui.fillNone)))),
-    h('div', { class: 'tool-sep' }), snapBtn);
+    h('div', { class: 'tool-sep' }), snapBtn, odBtn);
 
-    // center column
+    // workspace: stage in the middle, panels docked around it (see workspace.ts)
     this.editBar = h('div', { class: 'editbar' });
     const stageHost = h('div', { class: 'stage-host' });
-    const tlHost = h('div', { class: 'timeline-host' });
-    const vsplit = h('div', { class: 'splitter h', title: 'Drag to resize' });
-    const center = h('div', { class: 'center' }, this.editBar, stageHost, vsplit, tlHost);
-
-    // right dock
-    this.rightTop = h('div', { class: 'dock-group' });
-    this.rightBottom = h('div', { class: 'dock-group' });
-    const dsplit = h('div', { class: 'splitter h', title: 'Drag to resize' });
-    const right = h('div', { class: 'right-dock' }, this.rightTop, dsplit, this.rightBottom);
-    const rsplit = h('div', { class: 'splitter v', title: 'Drag to resize' });
-
-    const main = h('div', { class: 'main' }, toolbar, center, rsplit, right);
+    const tlHost = h('div', { class: 'timeline-host ws-panel' });
+    const main = h('div', { class: 'main' });
     this.root.append(menubar, main);
 
     this.stage = new Stage(stageHost);
     this.timeline = new TimelinePanel(tlHost, this.stage);
     this.stage.canvas.addEventListener('contextmenu', (e) => this.stageContextMenu(e));
 
-    const propsHost = h('div', { class: 'tab-page' });
-    const libHost = h('div', { class: 'tab-page' });
+    const page = () => h('div', { class: 'ws-panel' });
+    const propsHost = page(), libHost = page(), colorHost = page(), alignHost = page(), transformHost = page();
     this.props = new PropertiesPanel(propsHost);
     this.library = new LibraryPanel(libHost);
-    this.makeTabs(this.rightTop, [['properties', 'Properties', propsHost], ['library', 'Library', libHost]]);
-    const colorHost = h('div', { class: 'tab-page' });
-    const alignHost = h('div', { class: 'tab-page' });
-    const transformHost = h('div', { class: 'tab-page' });
     new ColorPanel(colorHost);
     new AlignPanel(alignHost);
     new TransformPanel(transformHost);
-    this.makeTabs(this.rightBottom, [['color', 'Color', colorHost], ['align', 'Align', alignHost], ['transform', 'Transform', transformHost]]);
-
-    // splitters (sizes persisted)
-    const sizes = this.loadSizes();
-    const apply = () => {
-      this.root.style.setProperty('--tl-h', `${sizes.tl}px`);
-      this.root.style.setProperty('--right-w', `${sizes.right}px`);
-      this.root.style.setProperty('--dock-split', `${sizes.dock}px`);
-    };
-    apply();
-    this.splitter(vsplit, 'y', (d) => { sizes.tl = Math.max(90, Math.min(window.innerHeight - 200, sizes.tl - d)); apply(); }, () => this.saveSizes(sizes));
-    this.splitter(rsplit, 'x', (d) => { sizes.right = Math.max(220, Math.min(560, sizes.right - d)); apply(); }, () => this.saveSizes(sizes));
-    this.splitter(dsplit, 'y', (d) => { sizes.dock = Math.max(150, Math.min(window.innerHeight - 160, sizes.dock + d)); apply(); }, () => this.saveSizes(sizes));
+    toolbar.classList.add('ws-panel');
+    this.workspace = new Workspace(main, this.editBar, stageHost, [
+      { id: 'tools', title: 'Tools', el: toolbar },
+      { id: 'timeline', title: 'Timeline', el: tlHost },
+      { id: 'properties', title: 'Properties', el: propsHost },
+      { id: 'library', title: 'Library', el: libHost },
+      { id: 'color', title: 'Color', el: colorHost },
+      { id: 'align', title: 'Align', el: alignHost },
+      { id: 'transform', title: 'Transform', el: transformHost },
+    ]);
+    const label = () => { if (this.wsBtn) this.wsBtn.textContent = `${this.workspace.name} ▾`; };
+    label();
+    this.workspace.onChange = () => { this.stage.resize(); label(); if (isElectron && isMac) void this.syncNativeMenu(); };
     this.updateTools();
   }
 
-  private loadSizes() {
-    const def = { tl: 230, right: 300, dock: Math.round(window.innerHeight * 0.58) };
-    try { return { ...def, ...JSON.parse(localStorage.getItem('celerity.layout') || '{}') }; } catch { return def; }
-  }
-  private saveSizes(s: unknown) { try { localStorage.setItem('celerity.layout', JSON.stringify(s)); } catch { /* ignore */ } }
-  private resetWorkspace() {
-    try { localStorage.removeItem('celerity.layout'); } catch { /* ignore */ }
-    this.root.classList.remove('no-timeline', 'no-tools');
-    const s = this.loadSizes();
-    this.root.style.setProperty('--tl-h', `${s.tl}px`);
-    this.root.style.setProperty('--right-w', `${s.right}px`);
-    this.root.style.setProperty('--dock-split', `${s.dock}px`);
+  workspace!: Workspace;
+  private wsBtn: HTMLElement | null = null;
+
+  /** Window › panel: show it, bring it to the front, or close it when it is already in front. */
+  togglePanel(id: PanelId) { this.workspace.toggle(id); }
+  showTab(id: string) { this.workspace.focus(id as PanelId); }
+
+  private workspaceMenu(): MenuItem[] {
+    const { builtIn, custom } = this.workspace.names();
+    const cur = this.workspace.name;
+    return [
+      ...builtIn.map((n) => ({ label: n, checked: () => cur === n, action: () => this.workspace.switchTo(n) })),
+      ...(custom.length ? [SEP, ...custom.map((n) => ({ label: n, checked: () => cur === n, action: () => this.workspace.switchTo(n) }))] : []),
+      SEP,
+      { label: 'New Workspace…', action: () => this.newWorkspaceDialog() },
+      { label: 'Delete Workspace…', enabled: () => custom.length > 0, action: () => this.deleteWorkspaceDialog() },
+      { label: `Reset "${cur}"`, action: () => this.workspace.reset() },
+    ];
   }
 
-  private splitter(el: HTMLElement, axis: 'x' | 'y', onDelta: (d: number) => void, done: () => void) {
-    el.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      el.setPointerCapture(e.pointerId);
-      let last = axis === 'x' ? e.clientX : e.clientY;
-      const mv = (ev: PointerEvent) => { const cur = axis === 'x' ? ev.clientX : ev.clientY; onDelta(cur - last); last = cur; };
-      const up = () => { el.removeEventListener('pointermove', mv); el.removeEventListener('pointerup', up); done(); };
-      el.addEventListener('pointermove', mv);
-      el.addEventListener('pointerup', up);
+  private newWorkspaceDialog() {
+    const input = h('input', { type: 'text', value: '', placeholder: 'My Workspace', spellcheck: false }) as HTMLInputElement;
+    input.addEventListener('keydown', (e) => e.stopPropagation());
+    modal({
+      title: 'New Workspace', width: 380,
+      body: h('div', { class: 'form' }, row('Name', input), h('div', { class: 'hint' }, 'Saves the current panel arrangement. Built-in workspaces can\'t be overwritten.')),
+      buttons: [{ label: 'Cancel' }, {
+        label: 'OK', primary: true, onClick: () => {
+          const name = input.value.trim();
+          if (!name) return false;
+          if (this.workspace.names().builtIn.includes(name)) { toast('Choose a name that is not a built-in workspace.', 'error'); return false; }
+          this.workspace.saveAs(name);
+          toast(`Saved workspace "${name}"`, 'ok', 1500);
+        },
+      }],
     });
+    requestAnimationFrame(() => input.focus());
   }
 
-  private tabSwitchers = new Map<string, () => void>();
-  private makeTabs(host: HTMLElement, tabs: [string, string, HTMLElement][]) {
-    const bar = h('div', { class: 'tabbar' });
-    const pages = h('div', { class: 'tab-pages' });
-    const show = (id: string) => {
-      bar.querySelectorAll('.tab').forEach((t) => t.classList.toggle('on', (t as HTMLElement).dataset.id === id));
-      for (const [tid, , page] of tabs) page.classList.toggle('on', tid === id);
-    };
-    for (const [id, label, page] of tabs) {
-      const t = h('button', { class: 'tab', 'data-id': id }, label);
-      t.addEventListener('click', () => show(id));
-      bar.append(t);
-      pages.append(page);
-      this.tabSwitchers.set(id, () => show(id));
-    }
-    host.append(bar, pages);
-    show(tabs[0][0]);
-  }
-
-  showTab(id: string) { this.tabSwitchers.get(id)?.(); }
-  private togglePanel(which: 'timeline' | 'tools') {
-    this.root.classList.toggle(`no-${which}`);
-    this.stage.resize();
+  private deleteWorkspaceDialog() {
+    const custom = this.workspace.names().custom;
+    if (!custom.length) return;
+    let pick = custom[0];
+    modal({
+      title: 'Delete Workspace', width: 380,
+      body: h('div', { class: 'form' }, row('Workspace', select(pick, custom.map((n) => [n, n] as [string, string]), (v) => { pick = v; }))),
+      buttons: [{ label: 'Cancel' }, { label: 'Delete', primary: true, onClick: () => { this.workspace.remove(pick); } }],
+    });
   }
 
   // ---------------- edit bar ----------------
@@ -536,7 +540,7 @@ export class App {
       i('modify.convertSymbol'), i('modify.breakApart'), i('modify.group'), i('modify.ungroup'), SEP,
       { label: 'Arrange', submenu: [i('modify.front'), i('modify.forward'), i('modify.backward'), i('modify.back')] },
       { label: 'Transform', submenu: [i('modify.rotateCW'), i('modify.rotateCCW'), i('modify.flipH'), i('modify.flipV'), i('modify.removeTransform')] },
-      SEP, i('insert.classicTween'), i('insert.shapeTween'),
+      SEP, i('insert.motionTween'), i('insert.shapeTween'), i('insert.classicTween'),
       ...(hit.el.type === 'symbol' ? [SEP, i('edit.editSelected', 'Edit in Place'), { label: 'Edit Symbol', action: () => store.enterSymbol((hit.el as { libraryItem: string }).libraryItem, null, false) }] : []),
       ...(hit.el.type === 'text' ? [SEP, { label: 'Edit Text', action: () => editText(this.stage, hit.el as never) }] : []),
     ] : [

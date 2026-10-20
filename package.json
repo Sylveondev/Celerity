@@ -1,7 +1,7 @@
 {
   "name": "celerity",
   "productName": "Celerity",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A fast, free 2D animation studio compatible with Adobe Animate .fla files. Exports SWF, video, GIF, PNG sequences, SVG and sprite sheets.",
   "main": "dist/main.js",
   "author": {

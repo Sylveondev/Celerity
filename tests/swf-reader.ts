@@ -141,6 +141,11 @@ export interface SwfInfo {
   showFrames: number;
   labels: string[];
   actions: number;
+  sounds: { id: number; format: number; rate: number; bits16: boolean; stereo: boolean; samples: number; dataLen: number }[];
+  startSounds: { id: number; flags: number; outPoint?: number; loops?: number }[];
+  videos: { id: number; frames: number; width: number; height: number; codec: number }[];
+  videoFrames: { stream: number; frame: number; len: number }[];
+  ratios: number[];
 }
 
 function readTags(b: Uint8Array, start: number, end: number, info: SwfInfo, inSprite: number[] | null) {
@@ -163,7 +168,7 @@ function readTags(b: Uint8Array, start: number, end: number, info: SwfInfo, inSp
       if (flags & 2) pl.char = r.u16();
       if (flags & 4) pl.matrix = readMatrix(r);
       if (flags & 8) readCxform(r);
-      if (flags & 16) r.u16();
+      if (flags & 16) info.ratios.push(r.u16());
       if (flags & 32) pl.name = r.str();
       if (flags & 64) pl.clipDepth = r.u16();
       if (r.pos !== body.length) throw new Error(`PlaceObject2 length mismatch ${r.pos} != ${body.length}`);
@@ -197,6 +202,28 @@ function readTags(b: Uint8Array, start: number, end: number, info: SwfInfo, inSp
       if (r.pos !== body.length) throw new Error(`PlaceObject3 length mismatch ${r.pos} != ${body.length}`);
       info.places.push(pl);
     }
+    if (code === 14) {
+      const fl = body[2];
+      info.sounds.push({ id: body[0] | (body[1] << 8), format: fl >> 4, rate: (fl >> 2) & 3, bits16: !!(fl & 2), stereo: !!(fl & 1), samples: (body[3] | (body[4] << 8) | (body[5] << 16) | (body[6] << 24)) >>> 0, dataLen: len - 7 });
+    }
+    if (code === 15) {
+      const r = new BitReader(body);
+      const st: SwfInfo['startSounds'][number] = { id: r.u16(), flags: r.u8() };
+      if (st.flags & 1) r.u32();
+      if (st.flags & 2) st.outPoint = r.u32();
+      if (st.flags & 4) st.loops = r.u16();
+      if (st.flags & 8) throw new Error('unexpected envelope');
+      if (r.pos !== body.length) throw new Error(`StartSound length mismatch ${r.pos} != ${body.length}`);
+      info.startSounds.push(st);
+    }
+    if (code === 60) {
+      const r = new BitReader(body);
+      const v = { id: r.u16(), frames: r.u16(), width: r.u16(), height: r.u16(), codec: 0 };
+      r.u8(); v.codec = r.u8();
+      if (r.pos !== body.length) throw new Error('DefineVideoStream length');
+      info.videos.push(v);
+    }
+    if (code === 61) info.videoFrames.push({ stream: body[0] | (body[1] << 8), frame: body[2] | (body[3] << 8), len: len - 4 });
     if (code === 1 && !inSprite) info.showFrames++;
     if (code === 43) info.labels.push(new BitReader(body).str());
     if (code === 12) info.actions++;
@@ -223,7 +250,7 @@ export function readSwf(data: Uint8Array): SwfInfo {
   const rect = readRect(r);
   const fps = r.u16() / 256;
   const frames = r.u16();
-  const info: SwfInfo = { version, width: rect.xmax / 20, height: rect.ymax / 20, fps, frames, tags: [], shapes: [], places: [], sprites: [], showFrames: 0, labels: [], actions: 0 };
+  const info: SwfInfo = { version, width: rect.xmax / 20, height: rect.ymax / 20, fps, frames, tags: [], shapes: [], places: [], sprites: [], showFrames: 0, labels: [], actions: 0, sounds: [], startSounds: [], videos: [], videoFrames: [], ratios: [] };
   readTags(body, r.pos, body.length, info, null);
   return info;
 }

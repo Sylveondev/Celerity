@@ -1,3 +1,5 @@
+import type { Planar } from './planar';
+import type { MotionData } from './motion';
 // Core document model. Mirrors the XFL (FLA) object model closely so that
 // saving/opening .fla files is a near 1:1 mapping.
 
@@ -84,7 +86,16 @@ interface ElementBase {
 
 export interface ShapeElement extends ElementBase {
   type: 'shape';
+  /** Render/export paths. For merge shapes these are derived from `planar`. */
   paths: ShapePath[];
+  /** Present on "merge drawing model" shapes (Animate's raw shapes). */
+  planar?: Planar;
+  /** A piece of a merge shape picked up for moving/transforming; merged back when the edit ends. */
+  lifted?: boolean;
+  /** Set on shape-tween in-betweens of raw shapes (they become raw shapes again when keyframed). */
+  fromRaw?: boolean;
+  /** Pasted raw pieces stay separate while selected and merge once deselected (like Animate). */
+  floating?: boolean;
 }
 
 export type FilterDef =
@@ -127,14 +138,22 @@ export interface TextElement extends ElementBase {
   letterSpacing: number;
 }
 
+/** An embedded video placed on the timeline (Animate's DOMVideoInstance). */
+export interface VideoInstance extends ElementBase {
+  type: 'video';
+  libraryItem: string;
+  width: number;
+  height: number;
+}
+
 export interface GroupElement extends ElementBase {
   type: 'group';
   children: Element[];
 }
 
-export type Element = ShapeElement | SymbolInstance | BitmapInstance | TextElement | GroupElement;
+export type Element = ShapeElement | SymbolInstance | BitmapInstance | TextElement | GroupElement | VideoInstance;
 
-export type TweenType = 'none' | 'classic' | 'shape';
+export type TweenType = 'none' | 'classic' | 'shape' | 'motion';
 
 export interface Frame {
   start: number;
@@ -147,6 +166,9 @@ export interface Frame {
   label: string;
   labelType: 'name' | 'comment' | 'anchor';
   script: string;
+  /** Object-based motion tween curves (tween === 'motion'). */
+  motion?: MotionData;
+  sound?: FrameSound;
 }
 
 export type LayerType = 'normal' | 'guide' | 'mask' | 'folder';
@@ -193,7 +215,39 @@ export interface FolderItem {
   itemID: string;
 }
 
-export type LibraryItem = SymbolItem | BitmapItem | FolderItem;
+export interface SoundItem {
+  kind: 'sound';
+  name: string;
+  itemID: string;
+  assetId: string;         // raw bytes in the AssetStore (MP3 stream or Flash PCM/ADPCM)
+  codec: 'mp3' | 'pcm' | 'adpcm';
+  format: string;          // Animate format string, e.g. "44kHz 16bit Stereo"
+  sampleCount: number;
+}
+
+/** A sound attached to a keyframe (Animate's frame sound settings). */
+export interface FrameSound {
+  name: string;            // library item
+  sync: 'event' | 'start' | 'stop' | 'stream';
+  loopMode: 'repeat' | 'loop';
+  loops: number;           // repeat count
+}
+
+export interface VideoItem {
+  kind: 'video';
+  name: string;
+  itemID: string;
+  assetId: string;         // the video stream (FLV, MP4, MOV or WebM bytes)
+  mime: string;            // 'video/x-flv', 'video/mp4', 'video/webm'…
+  width: number;
+  height: number;
+  fps: number;
+  duration: number;        // seconds
+  videoType?: string;      // XFL videoType (kept for round trips)
+  datPrefix?: number[];    // bytes Animate stored before the stream in bin/*.dat
+}
+
+export type LibraryItem = SymbolItem | BitmapItem | FolderItem | SoundItem | VideoItem;
 
 export interface Doc {
   width: number;

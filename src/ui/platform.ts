@@ -19,9 +19,12 @@ interface NativeApi {
   openExternal(url: string): Promise<void>;
   showItem(p: string): Promise<void>;
   info(): Promise<{ platform: string; version: string }>;
+  media: {
+    transcode(data: Uint8Array, target: 'flv' | 'mp4' | 'wav'): Promise<{ ok: boolean; bytes?: Uint8Array; fps?: number; error?: string }>;
+  };
   video: {
     probe(): Promise<{ ok: boolean; version?: string }>;
-    start(o: { file: string; width: number; height: number; fps: number; format: string; quality: number; loop?: number }): Promise<number>;
+    start(o: { file: string; width: number; height: number; fps: number; format: string; quality: number; loop?: number; audioData?: Uint8Array }): Promise<number>;
     frame(id: number, data: Uint8Array): Promise<boolean>;
     finish(id: number): Promise<{ ok: boolean; error?: string }>;
     cancel(id: number): Promise<void>;
@@ -135,6 +138,7 @@ export const platform = {
   openExternal: (url: string) => { if (native) native.openExternal(url); else window.open(url, '_blank', 'noopener'); },
   showItem: (p: string) => native?.showItem(p),
   video: native?.video ?? null,
+  media: native?.media ?? null,
   on: (channel: string, fn: (...args: unknown[]) => void) => native?.on(channel, fn),
   basename: (p: string) => p.split(/[\\/]/).pop() || p,
 };

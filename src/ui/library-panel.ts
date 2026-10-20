@@ -11,7 +11,8 @@ import { icon } from './icons';
 import { contextMenu, SEP } from './menu';
 import { modal, row, confirmDialog } from './dialogs';
 import * as A from './actions';
-import { exportSpriteSheetDialog } from './exporter';
+import { exportSpriteSheetDialog, exportSymbolsDialog } from './exporter';
+import { audio } from './audio';
 
 const I = { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
 export const DRAG_MIME = 'application/x-celerity-library-item';
@@ -93,8 +94,8 @@ export class LibraryPanel {
       if (q && entry.kind !== 'folder' && !entry.name.toLowerCase().includes(q)) continue;
       if (q && entry.kind === 'folder') continue;
       const it = entry.item;
-      const ic = entry.kind === 'folder' ? 'folder' : entry.kind === 'bitmap' ? 'bitmap' : (it as { symbolType: SymbolType }).symbolType;
-      const typeLabel = entry.kind === 'folder' ? 'Folder' : entry.kind === 'bitmap' ? 'Bitmap' : ({ movieclip: 'Movie Clip', graphic: 'Graphic', button: 'Button' } as Record<string, string>)[ic];
+      const ic = entry.kind === 'folder' ? 'folder' : entry.kind === 'bitmap' ? 'bitmap' : entry.kind === 'sound' ? 'sound' : entry.kind === 'video' ? 'video' : (it as { symbolType: SymbolType }).symbolType;
+      const typeLabel = entry.kind === 'folder' ? 'Folder' : entry.kind === 'bitmap' ? 'Bitmap' : entry.kind === 'sound' ? 'Sound' : entry.kind === 'video' ? 'Video' : ({ movieclip: 'Movie Clip', graphic: 'Graphic', button: 'Button' } as Record<string, string>)[ic];
       const nameEl = h('span', { class: 'lib-name' }, baseName(entry.name));
       const rowEl = h('div', {
         class: `lib-item${this.selected.has(entry.name) ? ' selected' : ''}`,
@@ -111,7 +112,13 @@ export class LibraryPanel {
           return;
         }
         if (e.ctrlKey || e.metaKey) { if (this.selected.has(entry.name)) this.selected.delete(entry.name); else this.selected.add(entry.name); }
-        else this.selected = new Set([entry.name]);
+        else if (e.shiftKey && this.anchor) {
+          // range selection in display order
+          const order = [...this.list.querySelectorAll<HTMLElement>('.lib-item')].map((x) => x.title);
+          const a = order.indexOf(this.anchor), b = order.indexOf(entry.name);
+          if (a >= 0 && b >= 0) this.selected = new Set(order.slice(Math.min(a, b), Math.max(a, b) + 1));
+        } else this.selected = new Set([entry.name]);
+        if (!e.shiftKey) this.anchor = entry.name;
         this.render();
         this.list.focus();
       });
@@ -119,6 +126,7 @@ export class LibraryPanel {
         if (entry.kind === 'folder') { if (this.collapsed.has(entry.name)) this.collapsed.delete(entry.name); else this.collapsed.add(entry.name); this.render(); return; }
         if ((e.target as HTMLElement).classList.contains('lib-name')) { this.rename(entry.name, nameEl); return; }
         if (entry.kind === 'symbol') store.enterSymbol(entry.name, null, false);
+        if (entry.kind === 'sound' && it?.kind === 'sound') void audio.preview(it);
       });
       rowEl.addEventListener('contextmenu', (e) => {
         e.preventDefault();
@@ -132,6 +140,7 @@ export class LibraryPanel {
           { label: 'Properties…', enabled: entry.kind !== 'folder', action: () => this.properties(entry.name) },
           { label: 'Add to Stage', enabled: entry.kind !== 'folder', action: () => { const c = store.doc; A.placeLibraryItem(entry.name, c.width / 2, c.height / 2); } },
           { label: 'Export Sprite Sheet…', enabled: entry.kind === 'symbol', action: () => exportSpriteSheetDialog(entry.name) },
+          { label: this.selectedSymbols().length > 1 ? `Export ${this.selectedSymbols().length} Symbols…` : 'Export Selected Symbols…', enabled: this.selectedSymbols().length > 0, action: () => exportSymbolsDialog(this.selectedSymbols()) },
           SEP,
           { label: 'New Symbol…', action: () => newSymbolDialog() },
           { label: 'New Folder', action: () => this.newFolder() },
@@ -158,6 +167,12 @@ export class LibraryPanel {
     this.drawPreview();
   }
 
+  private anchor: string | null = null;
+
+  selectedSymbols(): string[] {
+    return [...this.selected].filter((n) => store.lib.get(n)?.kind === 'symbol');
+  }
+
   private moveTo(name: string, folder: string) {
     const newName = (folder ? folder + '/' : '') + baseName(name);
     if (newName === name || newName.startsWith(name + '/')) return;
@@ -175,8 +190,26 @@ export class LibraryPanel {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, W, H);
     const name = [...this.selected][0];
+    c.onclick = () => { const s = name ? store.lib.get(name) : undefined; if (s?.kind === 'sound') void audio.preview(s); };
     const it = name ? store.lib.get(name) : undefined;
     if (!it || it.kind === 'folder') return;
+    if (it.kind === 'sound') {
+      // waveform; click the preview to play
+      const pk = audio.peaksOf(it, Math.max(16, Math.floor(W / 2)));
+      ctx.fillStyle = '#2E9BFF';
+      if (!pk) { audio.onDecodedOnce(() => this.drawPreview()); return; }
+      const mid = H / 2;
+      for (let i = 0; i < pk.length; i++) {
+        const v = pk[i] * (H / 2 - 6);
+        ctx.fillRect(i * 2, mid - v, 1.5 * (W / pk.length / 2 > 1 ? 1 : 1), Math.max(1, v * 2));
+      }
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.font = `${11 * dpr}px system-ui, sans-serif`;
+      const d = audio.durationOf(it);
+      ctx.fillText(`${it.format} · ${d.toFixed(2)} s — click to play`, 8 * dpr, H - 8 * dpr);
+      return;
+    }
+    if (it.kind === 'video') return;
     if (it.kind === 'bitmap') {
       const a = store.assets.get(it.assetId);
       if (!a?.image) return;
@@ -251,10 +284,12 @@ export class LibraryPanel {
     const nameIn = h('input', { type: 'text', value: baseName(it.name), spellcheck: false }) as HTMLInputElement;
     let type: SymbolType = it.kind === 'symbol' ? it.symbolType : 'graphic';
     modal({
-      title: it.kind === 'symbol' ? 'Symbol Properties' : 'Bitmap Properties', width: 420,
+      title: it.kind === 'symbol' ? 'Symbol Properties' : it.kind === 'sound' ? 'Sound Properties' : it.kind === 'video' ? 'Video Properties' : 'Bitmap Properties', width: 420,
       body: h('div', { class: 'form' },
         row('Name', nameIn),
-        it.kind === 'symbol' ? row('Type', select(type, [['movieclip', 'Movie Clip'], ['graphic', 'Graphic'], ['button', 'Button']], (v) => { type = v; })) : row('Size', `${it.width} × ${it.height} px`)),
+        it.kind === 'symbol' ? row('Type', select(type, [['movieclip', 'Movie Clip'], ['graphic', 'Graphic'], ['button', 'Button']], (v) => { type = v; }))
+          : it.kind === 'sound' ? row('Format', `${it.format}${it.codec === 'mp3' ? ' (MP3)' : it.codec === 'adpcm' ? ' (ADPCM)' : ''} · ${audio.durationOf(it).toFixed(2)} s`)
+            : row('Size', `${it.width} × ${it.height} px`)),
       buttons: [{ label: 'Cancel' }, {
         label: 'OK', primary: true, onClick: () => {
           const folder = folderOf(it.name);

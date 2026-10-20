@@ -1,3 +1,4 @@
+import { mapShapeStyles } from '../core/merge';
 // Properties panel: context-sensitive (tool options, document, selection, frame).
 import type { BlendMode, ColorEffectMode, Element, FilterDef, Frame, LoopMode, ShapeElement, SymbolInstance, SymbolType, TextElement, CapStyle, JoinStyle } from '../core/types';
 import { dropdown } from './menu';
@@ -102,14 +103,29 @@ export class PropertiesPanel {
       line(textField(fr.label, (v) => A.setFrameProps((f) => { f.label = v.trim(); }, 'Frame Label'), 'Label name')),
       line(h('span', { class: 'lbl' }, 'Type'), select(fr.labelType, [['name', 'Name'], ['comment', 'Comment'], ['anchor', 'Anchor']], (v) => A.setFrameProps((f) => { f.labelType = v; }, 'Label Type'))),
     ));
-    const tweenSel = select(fr.tween, [['none', 'None'], ['classic', 'Classic Tween'], ['shape', 'Shape Tween']], (v) => A.createTween(v));
+    const tweenSel = select(fr.tween, [['none', 'None'], ['motion', 'Motion Tween'], ['classic', 'Classic Tween'], ['shape', 'Shape Tween']], (v) => A.createTween(v));
     this.el.append(section('Tweening',
       line(h('span', { class: 'lbl' }, 'Tween'), tweenSel),
       fr.tween !== 'none' && line(numField({ label: 'Ease', value: fr.ease, min: -100, max: 100, digits: 0, onChange: (v, f) => { if (f) A.setFrameProps((x) => { x.ease = v; }, 'Ease'); }, title: '-100 = ease in, 100 = ease out' }),
         select(fr.ease === 0 ? 'none' : fr.ease < 0 ? 'in' : 'out', [['none', 'Linear'], ['in', 'Ease in'], ['out', 'Ease out']], (v) => A.setFrameProps((x) => { x.ease = v === 'none' ? 0 : v === 'in' ? -100 : 100; }, 'Ease'))),
+      fr.tween === 'motion' && !!fr.motion && h('div', { class: 'hint' }, `${fr.motion.props.filter((p) => p.keys.length > 1).length} animated properties. Move or transform the object on any frame of the span to add property keyframes (F6 keys all properties).`),
       fr.tween === 'classic' && line(h('span', { class: 'lbl' }, 'Rotate'),
         select(fr.rotate, [['auto', 'Auto'], ['none', 'None'], ['cw', 'CW'], ['ccw', 'CCW']], (v) => A.setFrameProps((x) => { x.rotate = v; }, 'Rotate')),
         (fr.rotate === 'cw' || fr.rotate === 'ccw') && numField({ label: '×', value: fr.rotateTimes, min: 0, max: 100, digits: 0, onChange: (v, f) => { if (f) A.setFrameProps((x) => { x.rotateTimes = v; }, 'Rotate'); } })),
+    ));
+    // sound (Animate's Properties > Sound)
+    const sounds = store.doc.library.filter((i) => i.kind === 'sound').map((i) => [i.name, i.name] as [string, string]);
+    const snd = fr.sound;
+    const setSound = (fn: (f: Frame) => void, label = 'Frame Sound') => A.setFrameProps(fn, label);
+    this.el.append(section('Sound',
+      line(h('span', { class: 'lbl' }, 'Name'), select(snd?.name ?? '', [['', 'None'], ...sounds], (v) => setSound((f) => {
+        if (!v) delete f.sound;
+        else f.sound = { name: v, sync: f.sound?.sync ?? 'event', loopMode: f.sound?.loopMode ?? 'repeat', loops: f.sound?.loops ?? 1 };
+      }))),
+      !!snd && line(h('span', { class: 'lbl' }, 'Sync'), select(snd.sync, [['event', 'Event'], ['start', 'Start'], ['stop', 'Stop'], ['stream', 'Stream']], (v) => setSound((f) => { if (f.sound) f.sound.sync = v; }))),
+      !!snd && snd.sync !== 'stop' && line(select(snd.loopMode, [['repeat', 'Repeat'], ['loop', 'Loop']], (v) => setSound((f) => { if (f.sound) f.sound.loopMode = v; })),
+        snd.loopMode === 'repeat' && numField({ label: '×', value: snd.loops, min: 1, max: 65535, digits: 0, onChange: (v, fin) => { if (fin) setSound((f) => { if (f.sound) f.sound.loops = v; }); } })),
+      !sounds.length && h('div', { class: 'hint' }, 'Import a sound (File › Import) to attach it to this keyframe.'),
     ));
     const ta = h('textarea', { class: 'script', spellcheck: false, placeholder: 'stop();' }) as HTMLTextAreaElement;
     ta.value = fr.script;
@@ -286,18 +302,18 @@ export class PropertiesPanel {
     const applyFill = (v: ColorValue, final: boolean) => liveEdit('Fill Color', final, () => {
       for (const s of store.mutableSelection()) {
         if (s.el.type !== 'shape') continue;
-        s.el.paths = s.el.paths.map((p) => {
+        mapShapeStyles(s.el, (p) => {
           const closed = p.d[p.d.length - 1] === 4;
           if (v.none) return { ...p, fill: null };
           if (!p.fill && !closed) return p;
           return { ...p, fill: { kind: 'solid' as const, color: v.color, alpha: v.alpha } };
-        }).filter((p) => p.fill || p.stroke);
+        });
       }
     });
     const applyStroke = (fn: (st: NonNullable<ShapeElement['paths'][number]['stroke']> | null) => ShapeElement['paths'][number]['stroke'], label: string, final: boolean) => liveEdit(label, final, () => {
       for (const s of store.mutableSelection()) {
         if (s.el.type !== 'shape') continue;
-        s.el.paths = s.el.paths.map((p) => ({ ...p, stroke: fn(p.stroke) })).filter((p) => p.fill || p.stroke);
+        mapShapeStyles(s.el, (p) => ({ ...p, stroke: s.el.type === 'shape' && s.el.planar && !p.stroke ? null : fn(p.stroke) }));
       }
     });
     const sw = firstStroke?.width ?? ui.strokeWidth;

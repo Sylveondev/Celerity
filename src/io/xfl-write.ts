@@ -1,6 +1,7 @@
 // Writes documents as FLA files (zipped XFL), the format used by Animate CS5+.
 import type {
   BitmapItem, ColorEffect, Doc, Element, Fill, Frame, Layer, Matrix, ShapeElement, ShapePath, Stroke, SymbolItem, Timeline, TextElement,
+  SoundItem, VideoItem,
 } from '../core/types';
 import { XmlWriter } from './xml';
 import { encodeEdges, fillSide } from './xfl-edges';
@@ -9,6 +10,10 @@ import { multiply, IDENTITY } from '../core/matrix';
 import { transformPath } from '../core/path';
 import { fmtNum, baseName, folderOf } from '../core/util';
 import { layoutText } from '../core/symbols';
+import { transformPlanar, type Planar } from '../core/planar';
+import { writeMotionObject } from './xfl-motion';
+
+let docFps = 24;
 import type { AssetStore } from '../core/assets';
 
 const NS = { 'xmlns:xsi': 'http://www.w3.org/2001/XMLSchema-instance', xmlns: 'http://ns.adobe.com/xfl/2008/' };
@@ -109,8 +114,51 @@ function writeShapePaths(w: XmlWriter, paths: ShapePath[], m: Matrix, isDrawingO
   w.close();
 }
 
+const tw = (v: number) => String(Math.round(v * 20));
+
+/** Writes a merge-drawing-model shape straight from its planar edges. */
+function writePlanar(w: XmlWriter, p: Planar) {
+  w.open('DOMShape');
+  if (p.fills.length) {
+    w.open('fills');
+    p.fills.forEach((fl, i) => { w.open('FillStyle', { index: i + 1 }); writeFill(w, fl); w.close(); });
+    w.close();
+  }
+  if (p.strokes.length) {
+    w.open('strokes');
+    p.strokes.forEach((s, i) => { w.open('StrokeStyle', { index: i + 1 }); writeStroke(w, s); w.close(); });
+    w.close();
+  }
+  // one <Edge> per style combination; edges are chained where they connect
+  const groups = new Map<string, number[][]>();
+  for (const e of p.edges) {
+    const k = `${e[7]},${e[8]},${e[9]}`;
+    const g = groups.get(k);
+    if (g) g.push(e); else groups.set(k, [e]);
+  }
+  w.open('edges');
+  for (const [k, list] of groups) {
+    const [f0, f1, st] = k.split(',').map(Number);
+    let s = '';
+    let cx = NaN, cy = NaN;
+    for (const e of list) {
+      if (tw(e[0]) !== tw(cx) || tw(e[1]) !== tw(cy)) s += `!${tw(e[0])} ${tw(e[1])}`;
+      s += e[6] ? `[${tw(e[2])} ${tw(e[3])} ${tw(e[4])} ${tw(e[5])}` : `|${tw(e[4])} ${tw(e[5])}`;
+      cx = e[4]; cy = e[5];
+    }
+    w.leaf('Edge', { fillStyle0: f0 || undefined, fillStyle1: f1 || undefined, strokeStyle: st || undefined, edges: s });
+  }
+  w.close();
+  w.close();
+}
+
 function writeShape(w: XmlWriter, el: ShapeElement, parent: Matrix) {
   const m = multiply(parent, el.matrix);
+  if (el.planar) {
+    const ident = m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1 && m.tx === 0 && m.ty === 0;
+    writePlanar(w, ident ? el.planar : transformPlanar(el.planar, m));
+    return;
+  }
   if (el.paths.length <= 1) {
     writeShapePaths(w, el.paths, m, true);
     return;
@@ -227,28 +275,45 @@ function writeElement(w: XmlWriter, el: Element, parent: Matrix = IDENTITY) {
       writeMatrix(w, multiply(parent, el.matrix));
       w.close();
       break;
+    case 'video':
+      w.open('DOMVideoInstance', { libraryItemName: el.libraryItem, frameRight: Math.round(el.width * 20), frameBottom: Math.round(el.height * 20) });
+      writeMatrix(w, multiply(parent, el.matrix));
+      w.close();
+      break;
     case 'text':
       writeText(w, el, parent);
       break;
   }
 }
 
-const KEYMODE = { none: 9728, classic: 22017, shape: 17922 };
+const KEYMODE = { none: 9728, classic: 22017, shape: 17922, motion: 8195 };
 
 function writeFrame(w: XmlWriter, fr: Frame) {
   w.open('DOMFrame', {
     index: fr.start,
     duration: fr.duration > 1 ? fr.duration : undefined,
-    tweenType: fr.tween === 'classic' ? 'motion' : fr.tween === 'shape' ? 'shape' : undefined,
+    tweenType: fr.tween === 'classic' ? 'motion' : fr.tween === 'shape' ? 'shape' : fr.tween === 'motion' && fr.motion ? 'motion object' : undefined,
+    motionTweenScale: fr.tween === 'motion' && fr.motion ? 'false' : undefined,
+    isMotionObject: fr.tween === 'motion' && fr.motion ? 'true' : undefined,
+    visibleAnimationKeyframes: fr.tween === 'motion' && fr.motion ? 4194303 : undefined,
     motionTweenSnap: fr.tween === 'classic' ? 'true' : undefined,
     motionTweenRotate: fr.tween === 'classic' && fr.rotate !== 'auto'
       ? (fr.rotate === 'cw' ? 'clockwise' : fr.rotate === 'ccw' ? 'counter-clockwise' : 'none') : undefined,
     motionTweenRotateTimes: fr.tween === 'classic' && (fr.rotate === 'cw' || fr.rotate === 'ccw') && fr.rotateTimes ? fr.rotateTimes : undefined,
-    acceleration: fr.tween !== 'none' && fr.ease ? Math.round(fr.ease) : undefined,
+    acceleration: fr.tween !== 'none' && fr.tween !== 'motion' && fr.ease ? Math.round(fr.ease) : undefined,
     name: fr.label || undefined,
     labelType: fr.label ? fr.labelType : undefined,
-    keyMode: KEYMODE[fr.tween],
+    soundName: fr.sound?.name || undefined,
+    soundSync: fr.sound && fr.sound.sync !== 'event' ? fr.sound.sync : undefined,
+    soundLoopMode: fr.sound?.loopMode === 'loop' ? 'loop' : undefined,
+    soundLoop: fr.sound && fr.sound.loopMode === 'repeat' && fr.sound.loops > 1 ? fr.sound.loops : undefined,
+    keyMode: fr.tween === 'motion' && !fr.motion ? KEYMODE.none : KEYMODE[fr.tween],
   });
+  if (fr.tween === 'motion' && fr.motion) {
+    const data = { ...fr.motion, timeMaps: fr.motion.timeMaps.length ? fr.motion.timeMaps.slice() : [{ type: 'Quadratic', strength: 0 }] };
+    if (data.timeMaps[0].type === 'Quadratic') data.timeMaps[0] = { ...data.timeMaps[0], strength: fr.ease };
+    writeMotionObject(w, { ...fr, motion: data }, docFps);
+  }
   if (fr.script && fr.script.trim()) {
     w.open('Actionscript');
     w.cdataEl('script', fr.script);
@@ -356,6 +421,7 @@ export interface WriteFlaOptions { assets: AssetStore; pixels: PixelSource['pixe
 
 export async function writeFla(doc: Doc, opts: WriteFlaOptions): Promise<Uint8Array> {
   const now = Math.floor(Date.now() / 1000);
+  docFps = doc.fps || 24;
   const entries: ZipEntryIn[] = [{ name: 'mimetype', data: 'application/vnd.adobe.xfl', store: true }];
   const w = new XmlWriter();
   w.open('DOMDocument', {
@@ -394,7 +460,9 @@ export async function writeFla(doc: Doc, opts: WriteFlaOptions): Promise<Uint8Ar
   }
 
   const bitmaps = doc.library.filter((i): i is BitmapItem => i.kind === 'bitmap');
-  if (bitmaps.length) {
+  const sounds = doc.library.filter((i): i is SoundItem => i.kind === 'sound');
+  const videos = doc.library.filter((i): i is VideoItem => i.kind === 'video');
+  if (bitmaps.length || sounds.length || videos.length) {
     w.open('media');
     let k = 0;
     for (const b of bitmaps) {
@@ -419,6 +487,43 @@ export async function writeFla(doc: Doc, opts: WriteFlaOptions): Promise<Uint8Ar
         bitmapDataHRef: px ? datName : undefined,
         frameRight: Math.round(b.width * 20),
         frameBottom: Math.round(b.height * 20),
+      });
+    }
+    for (const snd of sounds) {
+      const asset = opts.assets.get(snd.assetId);
+      if (!asset) continue;
+      const datName = `M ${++k} ${now}.dat`;
+      entries.push({ name: `bin/${datName}`, data: asset.bytes });
+      w.leaf('DOMSoundItem', {
+        name: snd.name,
+        itemID: snd.itemID,
+        sourceLastImported: now,
+        href: snd.name,
+        soundDataHRef: datName,
+        format: snd.format,
+        sampleCount: snd.sampleCount || undefined,
+        dataLength: snd.codec === 'mp3' ? asset.bytes.length : undefined,
+      });
+    }
+    for (const v of videos) {
+      const asset = opts.assets.get(v.assetId);
+      if (!asset) continue;
+      const datName = `M ${++k} ${now}.dat`;
+      const pre = v.datPrefix ? new Uint8Array(v.datPrefix) : new Uint8Array(0);
+      const data = new Uint8Array(pre.length + asset.bytes.length);
+      data.set(pre, 0); data.set(asset.bytes, pre.length);
+      entries.push({ name: `bin/${datName}`, data });
+      w.leaf('DOMVideoItem', {
+        name: v.name,
+        itemID: v.itemID,
+        sourceLastImported: now,
+        videoDataHRef: datName,
+        videoType: v.videoType ?? (v.mime === 'video/x-flv' ? 'h263 media' : 'h264 media'),
+        fps: fmtNum(v.fps, 3),
+        rate: '22kHz', bits: '16bit', channels: 'stereo',
+        width: Math.round(v.width),
+        height: Math.round(v.height),
+        length: fmtNum(v.duration, 3),
       });
     }
     w.close();

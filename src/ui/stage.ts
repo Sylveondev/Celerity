@@ -8,6 +8,27 @@ import { store, ui, setUI, onUI } from './state';
 import { tools, type Tool, type ToolEvent } from './tools';
 import { timelineFrameCount } from '../core/timeline';
 import { h } from './dom';
+import { toPath2D } from '../core/path';
+import { SUB, isMerge } from '../core/merge';
+import { frameAt } from '../core/timeline';
+import { motionKeyOffsets, motionPath } from '../core/motion';
+import { video } from './video';
+import { audio } from './audio';
+
+let hatch: CanvasPattern | null = null;
+/** Animate-style dot pattern drawn over selected parts of raw shapes. */
+function hatchPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (hatch) return hatch;
+  const c = document.createElement('canvas');
+  c.width = c.height = 4;
+  const x = c.getContext('2d')!;
+  x.fillStyle = 'rgba(255,255,255,0.55)';
+  x.fillRect(0, 0, 4, 4);
+  x.fillStyle = 'rgba(0,0,0,0.85)';
+  x.fillRect(0, 0, 1, 1); x.fillRect(2, 2, 1, 1);
+  hatch = ctx.createPattern(c, 'repeat');
+  return hatch;
+}
 
 const PASTEBOARD = '#2a2a2a';
 const SEL_COLOR = '#2E9BFF';
@@ -43,6 +64,7 @@ export class Stage {
     this.resize();
     this.bindInput();
     store.on(() => this.requestRender());
+    video.onFrame = () => this.requestRender();
     onUI((k) => { if (k !== 'recentColors') this.requestRender(); if (k === 'tool') this.updateCursor(); });
   }
 
@@ -113,7 +135,7 @@ export class Stage {
   }
 
   env(): RenderEnv {
-    return { lib: store.lib, assets: store.assets, playback: store.playing, includeHidden: false, showGuides: true, outlines: true, authoring: true };
+    return { lib: store.lib, assets: store.assets, playback: store.playing, includeHidden: false, showGuides: true, outlines: true, authoring: true, videoFrame: (n, o) => video.frameSync(n, o) };
   }
 
   // ---------------- rendering ----------------
@@ -277,7 +299,7 @@ export class Stage {
     // hover highlight
     if (this.hoverId && !sel.some((s) => s.el.id === this.hoverId) && (tool === 'select' || tool === 'subselect')) {
       const f = store.findElement(this.hoverId);
-      if (f) {
+      if (f && !isMerge(f.el)) {
         const r = transformRect(m, elementBounds(f.el, { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 }, store.lib));
         if (!isEmptyRect(r)) {
           ctx.strokeStyle = 'rgba(46,155,255,0.6)';
@@ -286,8 +308,49 @@ export class Stage {
         }
       }
     }
+    // motion tween paths of selected tweened objects
+    if (!store.ctx.groupPath.length) {
+      for (const s of sel) {
+        const fr = frameAt(s.layer, store.frame);
+        if (!fr || fr.tween !== 'motion' || !fr.motion || fr.elements[0]?.id !== s.el.id || fr.duration < 2) continue;
+        const pts = motionPath(fr).map((p) => apply(m, p.x, p.y));
+        ctx.strokeStyle = s.layer.color || SEL_COLOR;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+        ctx.stroke();
+        const keys = new Set(motionKeyOffsets(fr.motion));
+        pts.forEach((p, i) => {
+          ctx.fillStyle = keys.has(i) ? '#000' : s.layer.color || SEL_COLOR;
+          const r = keys.has(i) ? 3 : 1.6;
+          ctx.fillRect(p.x - r, p.y - r, r * 2, r * 2);
+        });
+      }
+    }
     if (tool === 'transform') return; // the transform tool draws its own box
     for (const s of sel) {
+      if (s.el.type === 'shape' && (s.el.id.startsWith(SUB) || s.el.lifted)) {
+        // selected part of a raw shape: dot pattern over its fills and strokes
+        const pat = hatchPattern(ctx);
+        if (!pat) continue;
+        const mm = multiply(m, s.el.matrix);
+        ctx.save();
+        setCtx(ctx, mm);
+        const sc = Math.sqrt(Math.abs(mm.a * mm.d - mm.b * mm.c)) || 1;
+        pat.setTransform(new DOMMatrix([1 / sc, 0, 0, 1 / sc, 0, 0]));
+        ctx.fillStyle = pat;
+        ctx.strokeStyle = pat;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        for (const p of s.el.paths) {
+          const path = toPath2D(p.d);
+          if (p.fill) ctx.fill(path);
+          if (p.stroke) { ctx.lineWidth = Math.max(p.stroke.width, 3 / sc); ctx.stroke(path); }
+        }
+        ctx.restore();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        continue;
+      }
       const r = inflateRect(transformRect(m, elementBounds(s.el, { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 }, store.lib)), 1);
       if (isEmptyRect(r)) continue;
       ctx.strokeStyle = s.layer.color || SEL_COLOR;
@@ -317,6 +380,7 @@ export class Stage {
     if (len <= 1) return;
     if (store.frame >= len - 1) store.setFrame(0);
     store.playing = true;
+    void audio.playTimeline(store.timeline(), store.frame, store.doc.fps);
     this.playStart = performance.now();
     this.playStartFrame = store.frame;
     this.playElapsed = store.frame;
@@ -327,8 +391,13 @@ export class Stage {
       let f = this.playStartFrame + elapsedFrames;
       this.playElapsed = f;
       if (f >= len2) {
-        if (ui.loop) f = f % len2;
-        else { store.setFrame(len2 - 1); this.stop(); return; }
+        if (ui.loop) {
+          // restart the clock (and the sounds) at each loop
+          f = f % len2;
+          this.playStart = performance.now() - (f / store.doc.fps) * 1000;
+          this.playStartFrame = 0;
+          void audio.playTimeline(store.timeline(), f, store.doc.fps);
+        } else { store.setFrame(len2 - 1); this.stop(); return; }
       }
       if (f !== store.frame) store.setFrame(f);
       this.playTimer = requestAnimationFrame(tick);
@@ -341,6 +410,7 @@ export class Stage {
   stop() {
     if (!store.playing) return;
     store.playing = false;
+    audio.stop();
     this.playElapsed = 0;
     cancelAnimationFrame(this.playTimer);
     this.onPlayState?.(false);

@@ -1,4 +1,8 @@
-import type { Doc, Element, Frame, GroupElement, Layer, LibraryItem, Matrix, SymbolItem, Timeline, SymbolInstance, SymbolType } from './types';
+import type { Doc, Element, Frame, GroupElement, Layer, LibraryItem, Matrix, SymbolItem, Timeline, SymbolInstance, SymbolType, ShapeElement, ShapePath } from './types';
+import { SUB, isMerge, partOf, removePart, planarSig, subAll, subFromParts, unionSub, mergeShapeElement, type SubSel } from './merge';
+import { emptyPlanar, mergePaths, mergePlanar, planarToPaths, transformPlanar, type Planar } from './planar';
+import { transformPath } from './path';
+import { motionTween, recordMotionEdit } from './motion';
 import { AssetStore } from './assets';
 import { indexLibrary, type LibIndex } from './symbols';
 import { frameAt, insertKeyframe, layerLength, resolveLayerFrame, timelineFrameCount } from './timeline';
@@ -33,6 +37,8 @@ export class Store {
   sceneIndex = 0;
   stack: EditEntry[] = [];
   selection: string[] = [];
+  /** Selected parts of merge shapes, keyed by shape id (selection holds `~<id>`). */
+  subSel = new Map<string, SubSel>();
   frameSel: FrameSelection | null = null;
   filePath: string | null = null;
   fileName = 'Untitled-1';
@@ -63,6 +69,8 @@ export class Store {
   on(fn: Listener) { this.listeners.push(fn); return () => { this.listeners = this.listeners.filter((l) => l !== fn); }; }
 
   emit(...what: string[]) {
+    // live drags on motion-tweened objects show up immediately
+    if (this.motionEdits.size && this.liveBefore && what.includes('doc')) this.flushMotion(false);
     for (const w of what) this.pending.add(w);
     if (this.scheduled) return;
     this.scheduled = true;
@@ -83,6 +91,7 @@ export class Store {
     this.sceneIndex = 0;
     this.stack = [{ symbol: null, groupPath: [], groupLayerId: null, frame: 0, layerId: doc.scenes[0]?.layers[0]?.id ?? null, matrix: identity(), parentVisible: false }];
     this.selection = [];
+    this.subSel.clear();
     this.frameSel = null;
     this.filePath = filePath;
     this.dirty = false;
@@ -97,8 +106,12 @@ export class Store {
   private snapshot(): Snapshot {
     return {
       doc: JSON.stringify(this.doc),
-      ctx: JSON.stringify({ stack: this.stack, selection: this.selection, sceneIndex: this.sceneIndex }),
+      ctx: this.ctxJSON(),
     };
+  }
+
+  private ctxJSON() {
+    return JSON.stringify({ stack: this.stack, selection: this.selection, sceneIndex: this.sceneIndex, subSel: [...this.subSel] });
   }
 
   private restore(s: Snapshot) {
@@ -106,10 +119,12 @@ export class Store {
     const c = JSON.parse(s.ctx);
     this.stack = c.stack;
     this.selection = c.selection;
+    this.subSel = new Map(c.subSel ?? []);
     this.sceneIndex = Math.min(c.sceneIndex ?? 0, this.doc.scenes.length - 1);
     this.lib = indexLibrary(this.doc);
     this.validateContext();
     this.current = s;
+    this.motionEdits.clear();
   }
 
   /** Runs a mutation as one undoable step. */
@@ -120,6 +135,8 @@ export class Store {
     let result: T;
     try {
       result = fn();
+      this.flushMotion(true);
+      this.settleMerge();
     } catch (e) {
       // roll back partial mutations
       this.restore(before);
@@ -160,6 +177,8 @@ export class Store {
     const before = this.liveBefore;
     this.liveBefore = null;
     if (!before) return;
+    this.flushMotion(true);
+    this.settleMerge();
     const after = this.snapshot();
     if (after.doc === before.doc) { this.current = after; return; }
     this.undoStack.push(before);
@@ -204,7 +223,7 @@ export class Store {
 
   /** Called after non-transactional UI state changes (frame, selection) so undo restores them. */
   syncContext() {
-    if (this.current) this.current = { doc: this.current.doc, ctx: JSON.stringify({ stack: this.stack, selection: this.selection, sceneIndex: this.sceneIndex }) };
+    if (this.current) this.current = { doc: this.current.doc, ctx: this.ctxJSON() };
   }
 
   markSaved(path: string | null) {
@@ -396,8 +415,49 @@ export class Store {
       if (!create) return null;
       return insertKeyframe(layer, f, true).elements;
     }
+    if (r.tweened && r.frame.tween === 'motion' && r.frame.motion) return this.motionProxy(layer, r.frame, r.offset);
     if (r.tweened) return insertKeyframe(layer, f, false).elements;
     return r.frame.elements;
+  }
+
+  // ---- motion tweens: edits at any frame of the span become property keys ----
+  private motionEdits = new Map<string, { frame: Frame; offset: number; list: Element[] }>();
+
+  private motionProxy(layer: Layer, frame: Frame, offset: number): Element[] {
+    const key = `${layer.id}@${offset}`;
+    let e = this.motionEdits.get(key);
+    if (!e || e.frame !== frame) {
+      e = { frame, offset, list: structuredClone(motionTween(frame, offset)) };
+      this.motionEdits.set(key, e);
+    }
+    return e.list;
+  }
+
+  /** Writes edits made to motion-tweened objects back as property keys. */
+  private flushMotion(clear: boolean) {
+    if (!this.motionEdits.size) return;
+    for (const e of this.motionEdits.values()) {
+      const f = e.frame;
+      const base = f.elements[0];
+      if (!f.motion || !base) continue;
+      const edited = e.list.find((x) => x.id === base.id);
+      if (!edited) {
+        // the tweened object was removed: the span becomes a plain frame span
+        f.elements = e.list.slice();
+        f.tween = 'none';
+        delete f.motion;
+        continue;
+      }
+      recordMotionEdit(f, e.offset, base, edited);
+      if (edited.type === 'symbol' && base.type === 'symbol') {
+        // non-animated instance settings (looping, name, filters, blend) apply to the whole span
+        const { matrix: _m, color: _c, transformPoint: _t, ...rest } = edited;
+        void _m; void _c; void _t;
+        Object.assign(base, rest);
+      }
+      f.elements = [base, ...e.list.filter((x) => x !== edited)];
+    }
+    if (clear) this.motionEdits.clear();
   }
 
   /** All selectable layers at the current frame (top first). */
@@ -449,20 +509,83 @@ export class Store {
   selected(): { layer: Layer; el: Element }[] {
     const all = this.selectable();
     const set = new Set(this.selection);
-    return all.filter((s) => set.has(s.el.id)).reverse(); // bottom-to-top order
+    if (!this.subSel.size) return all.filter((s) => set.has(s.el.id)).reverse(); // bottom-to-top order
+    const present = new Set(all.map((s) => s.el.id));
+    const out: { layer: Layer; el: Element }[] = [];
+    for (const s of all) {
+      if (set.has(s.el.id)) out.push(s);
+      else if (isMerge(s.el) && set.has(SUB + s.el.id) && !present.has(SUB + s.el.id)) {
+        const v = this.virtualPart(s.el);
+        if (v) out.push({ layer: s.layer, el: v });
+      }
+    }
+    return out.reverse();
+  }
+
+  private virtCache = new Map<string, { planar: Planar; sel: SubSel; el: ShapeElement }>();
+
+  /** A read-only element representing the selected part of a merge shape. */
+  private virtualPart(base: ShapeElement & { planar: Planar }): ShapeElement | null {
+    const sel = this.subSel.get(base.id);
+    if (!sel) return null;
+    const c = this.virtCache.get(base.id);
+    if (c && c.planar === base.planar && c.sel === sel) return c.el;
+    if (sel.sig !== planarSig(base.planar)) return null;
+    const part = partOf(base.planar, sel);
+    if (!part.edges.length) return null;
+    const el: ShapeElement = { type: 'shape', id: SUB + base.id, matrix: base.matrix, planar: part, paths: planarToPaths(part), lifted: true };
+    this.virtCache.set(base.id, { planar: base.planar, sel, el });
+    return el;
+  }
+
+  /** The merge shape of a layer at the current frame (read-only). */
+  mergeShapeOf(layer: Layer): (ShapeElement & { planar: Planar }) | null {
+    const list = this.ctx.groupPath.length && layer.id === this.ctx.groupLayerId ? this.groupTarget()?.children ?? [] : this.displayed(layer);
+    return (list.find((e) => isMerge(e)) as ShapeElement & { planar: Planar }) ?? null;
   }
 
   select(ids: string[], additive = false) {
+    // whole merge shapes are selected as "all parts"
+    const mapped: string[] = [];
+    const subs: [string, SubSel][] = [];
+    const byId = new Map(this.selectable().map((s) => [s.el.id, s]));
+    for (const id of ids) {
+      const f = id.startsWith(SUB) ? null : byId.get(id);
+      if (f && isMerge(f.el)) { mapped.push(SUB + id); subs.push([id, subAll(f.el.planar)]); } else mapped.push(id);
+    }
     if (additive) {
       const set = new Set(this.selection);
-      for (const id of ids) { if (set.has(id)) set.delete(id); else set.add(id); }
+      for (const id of mapped) { if (set.has(id)) { set.delete(id); if (id.startsWith(SUB)) this.subSel.delete(id.slice(1)); } else set.add(id); }
+      for (const [id, s] of subs) if (set.has(SUB + id)) this.subSel.set(id, s);
       this.selection = [...set];
     } else {
-      this.selection = [...ids];
+      this.subSel = new Map(subs.filter(([id]) => mapped.includes(SUB + id)));
+      this.selection = [...mapped];
     }
+    this.settleFloaters();
+    this.afterSelect();
+  }
+
+  /** Selects parts of merge shapes (optionally adding to the selection). */
+  selectParts(parts: { elId: string; sel: SubSel }[], additive = false, others: string[] = []) {
+    if (!additive) { this.subSel = new Map(); this.selection = []; }
+    const set = new Set(this.selection);
+    for (const p of parts) {
+      const prev = additive ? this.subSel.get(p.elId) : undefined;
+      this.subSel.set(p.elId, prev && prev.sig === p.sel.sig ? unionSub(prev, p.sel) : p.sel);
+      set.add(SUB + p.elId);
+    }
+    for (const id of others) set.add(id);
+    this.selection = [...set];
+    this.settleFloaters();
+    this.afterSelect();
+  }
+
+  private afterSelect() {
     // selecting on stage moves the current layer to the selection's layer
     if (this.selection.length) {
-      const f = this.findElement(this.selection[this.selection.length - 1]);
+      const last = this.selection[this.selection.length - 1];
+      const f = this.findElement(last.startsWith(SUB) ? last.slice(1) : last);
       if (f && !this.ctx.groupPath.length) this.ctx.layerId = f.layer.id;
     }
     this.frameSel = null;
@@ -473,13 +596,32 @@ export class Store {
   clearSelection() {
     if (!this.selection.length) return;
     this.selection = [];
+    this.subSel.clear();
+    this.settleFloaters();
     this.syncContext();
     this.emit('selection');
   }
 
+  /** Merges deselected floating raw pieces into their layer (folded into the current history state). */
+  private settleFloaters() {
+    if (this.txDepth > 0 || this.liveBefore) return;
+    const sel = new Set(this.selection);
+    const lists: Element[][] = this.ctx.groupPath.length
+      ? [this.groupTarget()?.children ?? []]
+      : this.timeline().layers.map((l) => frameAt(l, this.frame)?.elements ?? []);
+    if (!lists.some((l) => l.some((e) => e.type === 'shape' && e.floating && !sel.has(e.id)))) return;
+    this.settleMerge();
+    this.current = this.snapshot();
+    this.lib = indexLibrary(this.doc);
+    this.dirty = true;
+    this.emit('doc');
+  }
+
   /**
    * Gets mutable references to the selected elements (creating keyframes where
-   * needed). Call inside a transaction.
+   * needed). Selected parts of merge shapes are lifted into temporary elements
+   * that merge back when the transaction or live edit ends. Call inside a
+   * transaction.
    */
   mutableSelection(): { layer: Layer; el: Element; list: Element[] }[] {
     const sel = this.selected();
@@ -487,10 +629,135 @@ export class Store {
     for (const s of sel) {
       const list = this.editableElements(s.layer);
       if (!list) continue;
-      const el = list.find((e) => e.id === s.el.id);
+      let el = list.find((e) => e.id === s.el.id);
+      if (!el && s.el.id.startsWith(SUB)) el = this.lift(list, s.el.id.slice(1)) ?? undefined;
       if (el) out.push({ layer: s.layer, el, list });
     }
     return out;
+  }
+
+  private lift(list: Element[], baseId: string): ShapeElement | null {
+    const base = list.find((e) => e.id === baseId);
+    const sel = this.subSel.get(baseId);
+    if (!isMerge(base) || !sel || sel.sig !== planarSig(base.planar)) return null;
+    const part = partOf(base.planar, sel);
+    base.planar = removePart(base.planar, sel);
+    base.paths = planarToPaths(base.planar);
+    const lifted: ShapeElement = { type: 'shape', id: SUB + baseId, matrix: base.matrix, planar: part, paths: planarToPaths(part), lifted: true };
+    list.splice(list.indexOf(base) + 1, 0, lifted);
+    return lifted;
+  }
+
+  /**
+   * Merges loose merge-shape pieces (lifted parts, pasted raw shapes) back into
+   * each layer's merge shape at the current frame and refreshes part selections.
+   */
+  private settleMerge() {
+    const lists: Element[][] = [];
+    if (this.ctx.groupPath.length) {
+      const g = this.groupTarget();
+      if (g) lists.push(g.children);
+    } else {
+      for (const layer of this.timeline().layers) {
+        const fr = frameAt(layer, this.frame);
+        if (fr) lists.push(fr.elements);
+      }
+    }
+    let selChanged = false;
+    for (const list of lists) {
+      let primary: (ShapeElement & { planar: Planar }) | null = null;
+      const extras: ShapeElement[] = [];
+      for (const e of list) {
+        if (e.type !== 'shape' || !e.planar) continue;
+        if (!primary && !e.lifted && !e.id.startsWith(SUB)) primary = e as ShapeElement & { planar: Planar };
+        else if (!(e.floating && this.selection.includes(e.id))) extras.push(e);
+      }
+      if (!primary && !extras.length) continue;
+      if (!primary) {
+        primary = mergeShapeElement(uid(), emptyPlanar()) as ShapeElement & { planar: Planar };
+        list.unshift(primary);
+      }
+      const P = primary;
+      const isI = (m: Matrix) => m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1 && m.tx === 0 && m.ty === 0;
+      if (!isI(P.matrix)) { P.planar = transformPlanar(P.planar, P.matrix); P.matrix = identity(); P.paths = planarToPaths(P.planar); }
+      const selectedParts: Planar[] = [];
+      for (const x of extras) {
+        const part = isI(x.matrix) ? x.planar! : transformPlanar(x.planar!, x.matrix);
+        P.planar = mergePlanar(P.planar, part, 'over');
+        list.splice(list.indexOf(x), 1);
+        const i = this.selection.indexOf(x.id);
+        if (i >= 0) { selectedParts.push(part); this.selection.splice(i, 1); selChanged = true; }
+      }
+      if (extras.length) P.paths = planarToPaths(P.planar);
+      // raw shapes always sit below drawing objects and symbols on their layer
+      const pi = list.indexOf(P);
+      if (pi > 0) { list.splice(pi, 1); list.unshift(P); }
+      if (!P.planar.edges.length) {
+        list.splice(list.indexOf(P), 1);
+        this.subSel.delete(P.id);
+        continue;
+      }
+      if (selectedParts.length) {
+        this.subSel.set(P.id, subFromParts(P.planar, selectedParts));
+        if (!this.selection.includes(SUB + P.id)) this.selection.push(SUB + P.id);
+        selChanged = true;
+      }
+      if (this.selection.includes(P.id)) {
+        this.selection = this.selection.map((id) => (id === P.id ? SUB + P.id : id));
+        this.subSel.set(P.id, subAll(P.planar));
+        selChanged = true;
+      }
+    }
+    // drop part selections whose shapes changed underneath them
+    for (const [id, s] of [...this.subSel]) {
+      const f = this.findElement(id);
+      if (!f || !isMerge(f.el) || s.sig !== planarSig(f.el.planar) || !this.selection.includes(SUB + id)) {
+        this.subSel.delete(id);
+        this.selection = this.selection.filter((x) => x !== SUB + id);
+        selChanged = true;
+      }
+    }
+    if (selChanged) this.emit('selection');
+  }
+
+  /** Draws paths in merge mode: they fuse with / cut the layer's raw shape. */
+  drawMerged(paths: ShapePath[], mode: 'over' | 'under' = 'over', label = 'Draw'): boolean {
+    const layer = this.layer();
+    if (!layer || layer.locked || !layer.visible || layer.type === 'folder') {
+      this.flash(layer?.locked ? 'The current layer is locked.' : 'The current layer is hidden or not editable.');
+      return false;
+    }
+    this.transact(label, () => {
+      const list = this.editableElements(layer);
+      if (!list) return;
+      let base = list.find((e) => isMerge(e)) as (ShapeElement & { planar: Planar }) | undefined;
+      if (!base) {
+        base = mergeShapeElement(uid(), emptyPlanar()) as ShapeElement & { planar: Planar };
+        list.unshift(base);
+      }
+      const inv = invert(base.matrix);
+      const local = paths.map((p) => ({ ...p, d: transformPath(p.d, inv) }));
+      base.planar = mergePaths(base.planar, local, mode);
+      base.paths = planarToPaths(base.planar);
+    });
+    return true;
+  }
+
+  /** Replaces a merge shape's geometry (tools that edit raw shapes). */
+  editMerge(elId: string, label: string, fn: (p: Planar) => Planar): boolean {
+    let ok = false;
+    this.transact(label, () => {
+      for (const layer of this.editLayers()) {
+        const list = this.editableElements(layer, false);
+        const el = list?.find((e) => e.id === elId);
+        if (!isMerge(el)) continue;
+        el.planar = fn(el.planar);
+        el.paths = planarToPaths(el.planar);
+        ok = true;
+        return;
+      }
+    });
+    return ok;
   }
 
   /** Adds an element to the current layer. Returns false if the layer is locked/hidden. */
@@ -542,7 +809,7 @@ export class Store {
       const b = elementsBounds(els, identity(), this.lib);
       const rx = b.x + b.w * reg.x, ry = b.y + b.h * reg.y;
       const sym = newSymbol(uniqueName(this.libraryNames(), name), type);
-      const moved = els.map((e) => ({ ...structuredClone(e), matrix: multiply(translate(-rx, -ry), e.matrix) }));
+      const moved = els.map((e) => { const c = { ...structuredClone(e), matrix: multiply(translate(-rx, -ry), e.matrix) }; if (c.type === 'shape') { delete c.lifted; delete c.floating; if (c.id.startsWith(SUB)) c.id = uid(); } return c; });
       sym.timeline.layers[0].frames[0].elements = moved;
       this.addLibraryItem(sym);
       // replace in the lowest layer containing selection, remove from others
@@ -575,8 +842,9 @@ export class Store {
       }
       const rename = (n: string) => (n === oldName ? newName : isFolder && n.startsWith(oldName + '/') ? newName + n.slice(oldName.length) : n);
       forEachElement(this.doc, (e) => {
-        if (e.type === 'symbol' || e.type === 'bitmap') e.libraryItem = rename(e.libraryItem);
+        if (e.type === 'symbol' || e.type === 'bitmap' || e.type === 'video') e.libraryItem = rename(e.libraryItem);
       });
+      forEachFrame(this.doc, (f) => { if (f.sound) f.sound.name = rename(f.sound.name); });
       for (const s of this.stack) if (s.symbol) s.symbol = rename(s.symbol);
     });
     return true;
@@ -591,11 +859,11 @@ export class Store {
     this.transact('Delete Library Item', () => {
       this.doc.library = this.doc.library.filter((i) => !del.has(i.name));
       const strip = (els: Element[]): Element[] => els.filter((e) => {
-        if ((e.type === 'symbol' || e.type === 'bitmap') && del.has(e.libraryItem)) return false;
+        if ((e.type === 'symbol' || e.type === 'bitmap' || e.type === 'video') && del.has(e.libraryItem)) return false;
         if (e.type === 'group') e.children = strip(e.children);
         return true;
       });
-      forEachFrame(this.doc, (f) => { f.elements = strip(f.elements); });
+      forEachFrame(this.doc, (f) => { f.elements = strip(f.elements); if (f.sound && del.has(f.sound.name)) delete f.sound; });
     });
     this.validateContext();
     this.emit('context');

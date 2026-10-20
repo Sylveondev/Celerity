@@ -7,7 +7,12 @@ import {
 import {
   ellipsePath, lineToPath, pathBounds, pathNodes, polyStarPath, rectPath, toPath2D, transformPath, flatten, OP_SIZE,
 } from '../core/path';
-import { elementBounds, elementsBounds, hitShapePath } from '../core/geometry';
+import { elementBounds, elementsBounds, hitShapePath, hitElement } from '../core/geometry';
+import {
+  bendEdge, erasePlanar, planarFromPaths, faceAt, moveVertex, nearestEdge, normalizePlanar, planarToPaths, recolorPlanar, setEdgeStrokes, strokeChain,
+  strokeEdgeAt, vertexNear, type Planar,
+} from '../core/planar';
+import { SUB, isMerge, planarSig, type SubSel } from '../core/merge';
 import { loopsToPath, simplifyRDP, smoothPolyline, straightenPolyline, traceBinary } from '../core/trace';
 import { cloneElements, uid, rgba } from '../core/util';
 import { layoutText } from '../core/symbols';
@@ -84,6 +89,13 @@ export function makeShape(paths: ShapePath[]): ShapeElement {
   };
 }
 
+/** Adds drawn geometry: a drawing object in Object Drawing mode, otherwise merged into the layer's raw shape. */
+export function drawShape(paths: ShapePath[], label = 'Draw') {
+  if (ui.objectDrawing) { store.addElement(makeShape(paths)); return; }
+  const fitted = paths.map((p) => ({ ...p, fill: needsFit(p.fill) ? fitGradient(p.fill!, pathBounds(p.d)) : p.fill }));
+  store.drawMerged(fitted, 'over', label);
+}
+
 function strokeOverlay(ctx: Ctx2D, m: Matrix, d: PathData, fill: Fill | null, stroke: Stroke | null) {
   setCtx(ctx, m);
   const p = toPath2D(d);
@@ -153,7 +165,7 @@ function snapCandidates(exclude: Set<string>): SnapLines {
     xs.push(0); ys.push(0);
   }
   for (const s of store.selectable()) {
-    if (exclude.has(s.el.id)) continue;
+    if (exclude.has(s.el.id) || exclude.has(SUB + s.el.id)) continue;
     const r = elementBounds(s.el, I, store.lib);
     if (isEmptyRect(r)) continue;
     xs.push(r.x, r.x + r.w / 2, r.x + r.w);
@@ -204,8 +216,56 @@ function drawSnapGuides(ctx: Ctx2D, m: Matrix, stage: Stage) {
 // ---------------- Selection tool (V) ----------------
 interface MoveDrag { kind: 'move'; x0: number; y0: number; originals: Map<string, Matrix>; bounds: Rect; lines: SnapLines; started: boolean; dup: boolean }
 interface MarqueeDrag { kind: 'marquee'; x0: number; y0: number; x1: number; y1: number; additive: boolean; base: string[] }
+interface BendDrag { kind: 'bend'; elId: string; layerId: string; x0: number; y0: number; started: boolean; edge: number; t: number; vertex: Point | null; orig: Planar; shift: boolean }
 
-let selDrag: MoveDrag | MarqueeDrag | null = null;
+let selDrag: MoveDrag | MarqueeDrag | BendDrag | null = null;
+
+// ---------------- merge shape (raw shape) picking ----------------
+type MergeEl = ShapeElement & { planar: Planar };
+
+/** Part of a raw shape under a point: a stroke segment or the fill area (double-click adds connected strokes). */
+function pickPart(el: MergeEl, lx: number, ly: number, tol: number, dbl: boolean): SubSel | null {
+  const p = el.planar;
+  const sig = planarSig(p);
+  const se = strokeEdgeAt(p, lx, ly, tol);
+  if (se >= 0) return { all: false, region: null, strokes: false, edges: strokeChain(p, se, dbl), sig };
+  const face = faceAt(p, lx, ly);
+  if (face && face.fill) {
+    let edges: number[] = [];
+    if (dbl) {
+      const set = new Set<number>();
+      for (const i of face.edges) if (p.edges[i][9]) for (const j of strokeChain(p, i, true)) set.add(j);
+      edges = [...set];
+    }
+    return { all: false, region: face.region, strokes: false, edges, sig };
+  }
+  return null;
+}
+
+function localTol(el: Element, stage: Stage, px = 4) {
+  return (px * stage.pxSize) / (scaleFactor(el.matrix) || 1);
+}
+
+/** Whether a point is on the currently selected part of a raw shape. */
+function onSelectedPart(el: MergeEl, x: number, y: number, stage: Stage): boolean {
+  const v = store.selected().find((s) => s.el.id === SUB + el.id);
+  return !!v && hitElement(v.el, I, x, y, store.lib, 3 * stage.pxSize);
+}
+
+function selectPartAt(el: MergeEl, x: number, y: number, stage: Stage, additive: boolean, dbl: boolean): boolean {
+  const lp = apply(invert(el.matrix), x, y);
+  const pick = pickPart(el, lp.x, lp.y, localTol(el, stage, 3), dbl);
+  if (pick) { store.selectParts([{ elId: el.id, sel: pick }], additive); return true; }
+  return false;
+}
+
+function mergeEditable(elId: string, layerId: string): MergeEl | null {
+  const layer = store.timeline().layers.find((l) => l.id === layerId) ?? store.layer();
+  if (!layer) return null;
+  const list = store.editableElements(layer);
+  const el = list?.find((e) => e.id === elId);
+  return isMerge(el) ? el : null;
+}
 
 export function beginMoveSelection(x0: number, y0: number, duplicate: boolean): MoveDrag {
   return { kind: 'move', x0, y0, originals: new Map(), bounds: selectionBounds(), lines: snapCandidates(new Set(store.selection)), started: false, dup: duplicate };
@@ -215,6 +275,24 @@ const selectTool: Tool = {
   cursor: () => 'default',
   down(e, stage) {
     const hit = stage.hitTest(e.x, e.y);
+    if (hit && isMerge(hit.el)) {
+      const el = hit.el;
+      if (store.selection.includes(SUB + el.id) && onSelectedPart(el, e.x, e.y, stage) && !e.shift) {
+        selDrag = beginMoveSelection(e.x, e.y, e.alt);
+        return;
+      }
+      const lp = apply(invert(el.matrix), e.x, e.y);
+      const tol = localTol(el, stage);
+      const v = vertexNear(el.planar, lp.x, lp.y, tol * 1.3);
+      const ne = nearestEdge(el.planar, lp.x, lp.y, tol);
+      if (v || ne) {
+        selDrag = { kind: 'bend', elId: el.id, layerId: hit.layer!.id, x0: e.x, y0: e.y, started: false, edge: ne?.index ?? -1, t: ne?.t ?? 0.5, vertex: v, orig: el.planar, shift: e.shift };
+        return;
+      }
+      if (selectPartAt(el, e.x, e.y, stage, e.shift, false)) selDrag = beginMoveSelection(e.x, e.y, e.alt);
+      else if (!e.shift) store.clearSelection();
+      return;
+    }
     if (hit) {
       const isSel = store.selection.includes(hit.el.id);
       if (e.shift) {
@@ -233,6 +311,23 @@ const selectTool: Tool = {
     if (!e.pressed || !selDrag) return;
     if (selDrag.kind === 'marquee') {
       selDrag.x1 = e.x; selDrag.y1 = e.y;
+      return;
+    }
+    if (selDrag.kind === 'bend') {
+      const b = selDrag;
+      if (!b.started) {
+        if (Math.hypot(e.x - b.x0, e.y - b.y0) < 3 * stage.pxSize) return;
+        b.started = true;
+        store.beginLive();
+        store.selection = [];
+        store.subSel.clear();
+      }
+      const el = mergeEditable(b.elId, b.layerId);
+      if (!el) return;
+      const lp = apply(invert(el.matrix), e.x, e.y);
+      el.planar = b.vertex ? moveVertex(b.orig, b.vertex.x, b.vertex.y, lp.x, lp.y) : bendEdge(b.orig, b.edge, b.t, lp.x, lp.y);
+      el.paths = planarToPaths(el.planar);
+      store.emit('doc');
       return;
     }
     const d = selDrag;
@@ -267,14 +362,35 @@ const selectTool: Tool = {
     selDrag = null;
     snapGuides = { x: null, y: null };
     if (!d) return;
+    if (d.kind === 'bend') {
+      if (d.started) {
+        const el = mergeEditable(d.elId, d.layerId);
+        if (el) { el.planar = normalizePlanar(el.planar); el.paths = planarToPaths(el.planar); }
+        store.commitLive('Reshape');
+        return;
+      }
+      // a click (no drag) selects the stroke segment or fill under the cursor
+      const f = store.findElement(d.elId);
+      if (f && isMerge(f.el) && selectPartAt(f.el, d.x0, d.y0, stage, d.shift, false)) return;
+      if (!d.shift) store.clearSelection();
+      return;
+    }
     if (d.kind === 'marquee') {
       const r = normRect(d.x0, d.y0, d.x1, d.y1);
       if (r.w < 1 && r.h < 1) return;
-      const ids = store.selectable().filter((s) => {
+      const ids: string[] = [];
+      const parts: { elId: string; sel: SubSel }[] = [];
+      for (const s of store.selectable()) {
         const b = elementBounds(s.el, I, store.lib);
-        return !isEmptyRect(b) && rectsIntersect(r, b);
-      }).map((s) => s.el.id);
-      store.select(d.additive ? [...new Set([...d.base, ...ids])] : ids);
+        if (isEmptyRect(b) || !rectsIntersect(r, b)) continue;
+        if (isMerge(s.el)) {
+          const whole = r.x <= b.x && r.y <= b.y && r.x + r.w >= b.x + b.w && r.y + r.h >= b.y + b.h;
+          const region = transformPath(rectPath(r.x, r.y, r.w, r.h), invert(s.el.matrix));
+          parts.push({ elId: s.el.id, sel: { all: whole, region: whole ? null : region, strokes: true, edges: [], sig: planarSig(s.el.planar) } });
+        } else ids.push(s.el.id);
+      }
+      if (parts.length) store.selectParts(parts, d.additive, ids);
+      else store.select(d.additive ? [...new Set([...d.base, ...ids])] : ids);
       return;
     }
     if (d.started) store.commitLive(d.dup ? 'Duplicate' : 'Move');
@@ -287,6 +403,7 @@ const selectTool: Tool = {
   dblclick(e, stage) {
     const hit = stage.hitTest(e.x, e.y);
     if (!hit) { store.exitContext(); return; }
+    if (isMerge(hit.el)) { selectPartAt(hit.el, e.x, e.y, stage, e.shift, true); return; }
     enterElement(hit.el, hit.layer!.id, stage);
   },
   overlay(ctx, m, stage) {
@@ -353,9 +470,37 @@ function linkedIndices(d: PathData, anchor: number): number[] {
   return [...new Set(out)];
 }
 
+// raw shapes: vertices and curve control points of the planar edges
+let rawSub: { elId: string; layerId: string } | null = null;
+interface RawDrag { elId: string; layerId: string; vertex: Point | null; edge: number; x0: number; y0: number; started: boolean; orig: Planar }
+let rawDrag: RawDrag | null = null;
+
+function rawSubEl(): MergeEl | null {
+  if (!rawSub) return null;
+  const f = store.findElement(rawSub.elId);
+  return f && isMerge(f.el) ? f.el : null;
+}
+
+function rawNodeAt(stage: Stage, x: number, y: number): RawDrag | null {
+  const el = rawSubEl();
+  if (!el || !rawSub) return null;
+  const lp = apply(invert(el.matrix), x, y);
+  const tol = localTol(el, stage, 5);
+  const p = el.planar;
+  for (let i = 0; i < p.edges.length; i++) {
+    const e = p.edges[i];
+    if (e[6] && Math.hypot(e[2] - lp.x, e[3] - lp.y) <= tol) return { elId: el.id, layerId: rawSub.layerId, vertex: null, edge: i, x0: x, y0: y, started: false, orig: p };
+  }
+  const v = vertexNear(p, lp.x, lp.y, tol);
+  if (v) return { elId: el.id, layerId: rawSub.layerId, vertex: v, edge: -1, x0: x, y0: y, started: false, orig: p };
+  return null;
+}
+
 const subselectTool: Tool = {
   cursor: () => 'default',
   down(e, stage) {
+    const rn = rawNodeAt(stage, e.x, e.y);
+    if (rn) { rawDrag = rn; return; }
     const node = nodeAt(stage, e.x, e.y);
     if (node) {
       const d = node.el.paths[node.pathIndex].d;
@@ -363,10 +508,39 @@ const subselectTool: Tool = {
       return;
     }
     const hit = stage.hitTest(e.x, e.y);
+    if (hit && isMerge(hit.el)) {
+      rawSub = { elId: hit.el.id, layerId: hit.layer!.id };
+      store.clearSelection();
+      stage.requestRender();
+      return;
+    }
+    rawSub = null;
     if (hit) store.select([hit.el.id], e.shift);
     else if (!e.shift) store.clearSelection();
   },
   move(e, stage) {
+    if (e.pressed && rawDrag) {
+      const r = rawDrag;
+      if (!r.started) {
+        if (Math.hypot(e.x - r.x0, e.y - r.y0) < 2 * stage.pxSize) return;
+        r.started = true;
+        store.beginLive();
+      }
+      const el = mergeEditable(r.elId, r.layerId);
+      if (!el) return;
+      const lp = apply(invert(el.matrix), e.x, e.y);
+      if (r.vertex) el.planar = moveVertex(r.orig, r.vertex.x, r.vertex.y, lp.x, lp.y);
+      else {
+        const edges = r.orig.edges.slice();
+        const ed = edges[r.edge].slice();
+        ed[2] = lp.x; ed[3] = lp.y;
+        edges[r.edge] = ed;
+        el.planar = { ...r.orig, edges };
+      }
+      el.paths = planarToPaths(el.planar);
+      store.emit('doc');
+      return;
+    }
     if (!e.pressed || !nodeDrag) return;
     const nd = nodeDrag;
     if (!nd.started) {
@@ -387,6 +561,12 @@ const subselectTool: Tool = {
     store.emit('doc');
   },
   up() {
+    if (rawDrag?.started) {
+      const el = mergeEditable(rawDrag.elId, rawDrag.layerId);
+      if (el) { el.planar = normalizePlanar(el.planar); el.paths = planarToPaths(el.planar); }
+      store.commitLive('Edit Points');
+    }
+    rawDrag = null;
     if (nodeDrag?.started) store.commitLive('Edit Points');
     nodeDrag = null;
   },
@@ -396,8 +576,39 @@ const subselectTool: Tool = {
   },
   overlay(ctx, m) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const raw = rawSubEl();
+    if (raw) {
+      const mm = multiply(m, raw.matrix);
+      setCtx(ctx, mm);
+      ctx.strokeStyle = '#2E9BFF';
+      ctx.lineWidth = 1 / scaleFactor(mm);
+      ctx.beginPath();
+      for (const ed of raw.planar.edges) {
+        ctx.moveTo(ed[0], ed[1]);
+        if (ed[6]) ctx.quadraticCurveTo(ed[2], ed[3], ed[4], ed[5]); else ctx.lineTo(ed[4], ed[5]);
+      }
+      ctx.stroke();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      const seen = new Set<string>();
+      for (const ed of raw.planar.edges) {
+        if (ed[6]) {
+          const c = apply(mm, ed[2], ed[3]);
+          ctx.fillStyle = '#fff'; ctx.strokeStyle = '#2E9BFF';
+          ctx.beginPath(); ctx.arc(c.x, c.y, 2.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        }
+        for (const [x, y] of [[ed[0], ed[1]], [ed[4], ed[5]]]) {
+          const k = `${x.toFixed(2)},${y.toFixed(2)}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          const a = apply(mm, x, y);
+          ctx.fillStyle = '#fff'; ctx.strokeStyle = '#2E9BFF';
+          ctx.fillRect(Math.round(a.x) - 3, Math.round(a.y) - 3, 6, 6);
+          ctx.strokeRect(Math.round(a.x) - 3.5, Math.round(a.y) - 3.5, 7, 7);
+        }
+      }
+    }
     for (const s of store.selected()) {
-      if (s.el.type !== 'shape') continue;
+      if (s.el.type !== 'shape' || s.el.planar) continue;
       const mm = multiply(m, s.el.matrix);
       for (const p of s.el.paths) {
         setCtx(ctx, mm);
@@ -426,7 +637,8 @@ const subselectTool: Tool = {
       }
     }
   },
-  cancel() { if (store.isLive) store.cancelLive(); nodeDrag = null; },
+  cancel() { if (store.isLive) store.cancelLive(); nodeDrag = null; rawDrag = null; },
+  deactivate() { rawSub = null; },
 };
 
 // ---------------- Free Transform tool (Q) ----------------
@@ -579,7 +791,9 @@ const transformTool: Tool = {
     if (!box || !h) {
       const hit = stage.hitTest(e.x, e.y);
       if (hit) {
-        if (!store.selection.includes(hit.el.id)) store.select([hit.el.id], e.shift);
+        if (isMerge(hit.el)) {
+          if (!(store.selection.includes(SUB + hit.el.id) && onSelectedPart(hit.el, e.x, e.y, stage))) selectPartAt(hit.el, e.x, e.y, stage, e.shift, true);
+        } else if (!store.selection.includes(hit.el.id)) store.select([hit.el.id], e.shift);
         const nb = transformBox();
         if (nb) tDrag = { handle: { kind: 'move', index: -1 }, box: nb, start: { x: e.x, y: e.y }, originals: new Map(), started: false, pivot: nb.pivot };
       } else {
@@ -734,7 +948,7 @@ function primitiveTool(id: ToolId): Tool {
       let stroke = currentStroke();
       if (id === 'line' && !stroke) stroke = { color: ui.fillColor, alpha: 1, width: ui.strokeWidth, caps: ui.caps, joints: ui.joints };
       if (!fill && !stroke) { store.flash('Both fill and stroke are set to "No color".'); return; }
-      store.addElement(makeShape([{ fill, stroke, d }]));
+      drawShape([{ fill, stroke, d }]);
     },
     overlay(ctx, m) {
       if (!shapeDrag?.e) return;
@@ -781,7 +995,7 @@ const pencilTool: Tool = {
     else if (ui.pencilMode === 'straighten') d = straightenPolyline(pts, 3 * px);
     else if (ui.pencilMode === 'ink') d = smoothPolyline(pts, 0.6 * px, false);
     else d = smoothPolyline(pts, 2.2 * px, false);
-    store.addElement(makeShape([{ fill: null, stroke, d }]));
+    drawShape([{ fill: null, stroke, d }]);
   },
   overlay(ctx, m) {
     if (!pencilPts || pencilPts.length < 1) return;
@@ -870,7 +1084,7 @@ const brushTool: Tool = {
     if (!pts) return;
     const d = brushPtsToPath(pts, 1 / stage.pxSize);
     if (!d.length) return;
-    store.addElement(makeShape([{ fill: currentFill(), stroke: null, d }]));
+    drawShape([{ fill: currentFill(), stroke: null, d }], 'Brush');
   },
   overlay(ctx, m, stage) {
     if (!brushPts) {
@@ -919,7 +1133,7 @@ function finishPen(closed: boolean) {
   const stroke = currentStroke() ?? (closed ? null : { color: ui.fillColor, alpha: 1, width: ui.strokeWidth, caps: ui.caps, joints: ui.joints });
   const fill = closed ? currentFill() : null;
   if (!fill && !stroke) return;
-  store.addElement(makeShape([{ fill, stroke, d }]));
+  drawShape([{ fill, stroke, d }]);
 }
 
 const penTool: Tool = {
@@ -1005,6 +1219,7 @@ function editShapePath(elId: string, index: number, fn: (p: ShapePath) => ShapeP
     if (!el || el.type !== 'shape') return;
     const np = fn(el.paths[index]);
     el.paths = np ? el.paths.map((p, i) => (i === index ? np : p)) : el.paths.filter((_, i) => i !== index);
+    if (el.planar) { el.planar = planarFromPaths(el.paths); el.paths = planarToPaths(el.planar); }
   });
 }
 
@@ -1055,11 +1270,28 @@ function bucketFillArea(stage: Stage, x: number, y: number): boolean {
   const loops = traceBinary(region, W, H);
   const d = loopsToPath(loops, scale, view.x, view.y, 0.5);
   if (!d.length) return true;
+  if (!ui.objectDrawing) {
+    // merge mode: the new fill slides under everything already on the raw shape
+    const f = currentFill();
+    store.drawMerged([{ fill: f && needsFit(f) ? fitGradient(f, pathBounds(d)) : f, stroke: null, d }], 'under', 'Fill');
+    return true;
+  }
   const shape = makeShape([{ fill: currentFill(), stroke: null, d }]);
   store.transact('Fill', () => {
     const list = store.editableElements(layer);
     list?.unshift(shape); // fills go below strokes
   });
+  return true;
+}
+
+/** Paint bucket on a raw shape: fills the enclosed area under the point. */
+function bucketMerge(el: MergeEl, x: number, y: number, fill: Fill): boolean {
+  const lp = apply(invert(el.matrix), x, y);
+  const face = faceAt(el.planar, lp.x, lp.y);
+  if (!face) return false;
+  const f = needsFit(fill) ? fitGradient(fill, pathBounds(face.region)) : fill;
+  if (face.fill && JSON.stringify(face.fill) === JSON.stringify(f)) return true;
+  store.editMerge(el.id, 'Fill', (p) => recolorPlanar(p, face.region, f, false));
   return true;
 }
 
@@ -1087,11 +1319,17 @@ const bucketTool: Tool = {
     const fill = currentFill();
     if (!fill) { store.flash('Choose a fill color first.'); return; }
     const hit = shapeAt(stage, e.x, e.y);
-    if (hit && hit.on === 'fill') {
+    if (hit && isMerge(hit.el)) {
+      if (bucketMerge(hit.el, e.x, e.y, fill)) return;
+    } else if (hit && hit.on === 'fill') {
       editShapePath(hit.el.id, hit.index, (p) => ({ ...p, fill: needsFit(fill) ? fitGradient(fill, pathBounds(p.d)) : fill }), 'Fill');
       return;
     }
-    if (hit && hit.on === 'stroke') return;
+    if (hit && hit.on === 'stroke' && !isMerge(hit.el)) return;
+    // an empty area enclosed by raw-shape strokes
+    const curLayer = store.layer();
+    const raw = curLayer ? store.mergeShapeOf(curLayer) : null;
+    if (raw && bucketMerge(raw, e.x, e.y, fill)) return;
     // closed stroke-only path under the cursor: give it a fill
     const layer = store.layer();
     if (layer) {
@@ -1122,6 +1360,20 @@ const inkTool: Tool = {
     const stroke = currentStroke();
     if (!stroke) { store.flash('Choose a stroke color first.'); return; }
     const hit = shapeAt(stage, e.x, e.y);
+    if (hit && isMerge(hit.el)) {
+      const el = hit.el;
+      const lp = apply(invert(el.matrix), e.x, e.y);
+      const p = el.planar;
+      const se = strokeEdgeAt(p, lp.x, lp.y, localTol(el, stage, 3));
+      let edges: number[] = [];
+      if (se >= 0) edges = strokeChain(p, se, true);
+      else {
+        const face = faceAt(p, lp.x, lp.y);
+        if (face) edges = face.edges;
+      }
+      if (edges.length) store.editMerge(el.id, 'Ink Bottle', (q) => setEdgeStrokes(q, edges, stroke));
+      return;
+    }
     if (hit) editShapePath(hit.el.id, hit.index, (p) => ({ ...p, stroke }), 'Ink Bottle');
   },
 };
@@ -1177,6 +1429,7 @@ function eraseWithStroke(stage: Stage, pts: Point[]) {
   let er = emptyRect();
   for (const p of pts) er = unionRect(er, { x: p.x - radius, y: p.y - radius, w: radius * 2, h: radius * 2 });
   const mode = ui.eraserMode;
+  let region: PathData | null = null;
   store.transact('Erase', () => {
     const list = store.editableElements(layer, false);
     if (!list) return;
@@ -1191,6 +1444,14 @@ function eraseWithStroke(stage: Stage, pts: Point[]) {
       }
       if (el.type !== 'shape') continue;
       const inv = invert(el.matrix);
+      if (isMerge(el)) {
+        region ??= brushPtsToPath(pts.map((p) => ({ x: p.x, y: p.y, w: radius * 2 })), 1 / stage.pxSize);
+        if (!region.length) continue;
+        el.planar = erasePlanar(el.planar, transformPath(region, inv), { fills: mode !== 'lines', strokes: mode !== 'fills' });
+        el.paths = planarToPaths(el.planar);
+        if (!el.planar.edges.length) list.splice(k, 1);
+        continue;
+      }
       const local = pts.map((p) => apply(inv, p.x, p.y));
       const lr = radius / (scaleFactor(el.matrix) || 1);
       const next: ShapePath[] = [];
@@ -1497,7 +1758,14 @@ const gradientTool: Tool = {
       m.c = (local.x - m.tx) / 819.2; m.d = (local.y - m.ty) / 819.2;
     }
     if (Math.abs(m.a * m.d - m.b * m.c) < 1e-9) return;
-    el.paths = el.paths.map((q, i) => (i === g.index ? { ...q, fill: { ...(q.fill as Exclude<Fill, { kind: 'solid' }>), matrix: m } } : q));
+    const oldFill = p.fill;
+    const newFill = { ...(oldFill as Exclude<Fill, { kind: 'solid' }>), matrix: m };
+    if (el.planar) {
+      const key = JSON.stringify(oldFill);
+      el.planar = { ...el.planar, fills: el.planar.fills.map((fl) => (JSON.stringify(fl) === key ? newFill : fl)) };
+      el.paths = planarToPaths(el.planar);
+      gradDrag.index = el.paths.findIndex((q) => q.fill === newFill);
+    } else el.paths = el.paths.map((q, i) => (i === g.index ? { ...q, fill: newFill } : q));
     store.emit('doc');
   },
   up() {

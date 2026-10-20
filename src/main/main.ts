@@ -292,7 +292,7 @@ function ffmpegPath(): string {
   return 'ffmpeg';
 }
 
-interface Job { proc: ChildProcessWithoutNullStreams; err: string; done: Promise<number> }
+interface Job { proc: ChildProcessWithoutNullStreams; err: string; done: Promise<number>; tmp?: string }
 const jobs = new Map<number, Job>();
 let jobId = 0;
 
@@ -310,10 +310,17 @@ ipcMain.handle('video:probe', async () => {
   });
 });
 
-ipcMain.handle('video:start', async (_e, o: { file: string; width: number; height: number; fps: number; format: string; quality: number; loop?: number }) => {
-  const args = ffmpegArgs(o);
+ipcMain.handle('video:start', async (_e, o: { file: string; width: number; height: number; fps: number; format: string; quality: number; loop?: number; audioData?: Uint8Array }) => {
+  // the soundtrack arrives as WAV bytes; ffmpeg reads it from a temp file
+  let tmp: string | undefined;
+  if (o.audioData && o.audioData.byteLength > 44 && o.format !== 'gif') {
+    tmp = path.join(app.getPath('temp'), `celerity-audio-${process.pid}-${Date.now()}.wav`);
+    await fsp.writeFile(tmp, Buffer.from(o.audioData.buffer, o.audioData.byteOffset, o.audioData.byteLength));
+  }
+  const args = ffmpegArgs({ file: o.file, width: o.width, height: o.height, fps: o.fps, format: o.format, quality: o.quality, loop: o.loop, audio: tmp });
   const proc = spawn(ffmpegPath(), args);
   const job: Job = {
+    tmp,
     proc,
     err: '',
     done: new Promise((resolve) => {
@@ -349,7 +356,39 @@ ipcMain.handle('video:finish', async (_e, id: number) => {
   job.proc.stdin.end();
   const code = await job.done;
   jobs.delete(id);
+  if (job.tmp) fsp.unlink(job.tmp).catch(() => {});
   return code === 0 ? { ok: true } : { ok: false, error: job.err.trim() || `ffmpeg exited with code ${code}` };
+});
+
+// Converts media with ffmpeg: video -> FLV (Animate/SWF embedding) or MP4 (preview of FLV), audio -> WAV.
+ipcMain.handle('media:transcode', async (_e, data: Uint8Array, target: 'flv' | 'mp4' | 'wav') => {
+  const dir = app.getPath('temp');
+  const stamp = `${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  const inp = path.join(dir, `celerity-in-${stamp}`);
+  const out = path.join(dir, `celerity-out-${stamp}.${target}`);
+  await fsp.writeFile(inp, Buffer.from(data.buffer, data.byteOffset, data.byteLength));
+  const even = 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+  const args = target === 'flv'
+    ? ['-y', '-hide_banner', '-i', inp, '-an', '-c:v', 'flv1', '-q:v', '3', '-vf', even, '-f', 'flv', out]
+    : target === 'mp4'
+      ? ['-y', '-hide_banner', '-i', inp, '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', '18', '-vf', even, '-movflags', '+faststart', out]
+      : ['-y', '-hide_banner', '-i', inp, '-vn', '-ac', '2', '-c:a', 'pcm_s16le', out];
+  let err = '';
+  const code = await new Promise<number>((resolve) => {
+    const proc = spawn(ffmpegPath(), args);
+    proc.stderr.on('data', (d) => { err += d; if (err.length > 40000) err = err.slice(-40000); });
+    proc.on('close', (c) => resolve(c ?? 1));
+    proc.on('error', (e) => { err += String(e); resolve(1); });
+  });
+  try {
+    const fps = /,\s*(\d+(?:\.\d+)?)\s*fps/.exec(err)?.[1];
+    if (code !== 0) return { ok: false, error: err.trim().split('\n').slice(-3).join('\n') || `ffmpeg exited with code ${code}` };
+    const bytes = await fsp.readFile(out);
+    return { ok: true, bytes: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength), fps: fps ? Number(fps) : undefined };
+  } finally {
+    fsp.unlink(inp).catch(() => {});
+    fsp.unlink(out).catch(() => {});
+  }
 });
 
 ipcMain.handle('video:cancel', async (_e, id: number) => {
@@ -357,4 +396,5 @@ ipcMain.handle('video:cancel', async (_e, id: number) => {
   if (!job) return;
   job.proc.kill('SIGKILL');
   jobs.delete(id);
+  if (job.tmp) fsp.unlink(job.tmp).catch(() => {});
 });

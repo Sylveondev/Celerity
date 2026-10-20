@@ -15,6 +15,8 @@ import { zlibDeflate } from './zip';
 import { fillSide } from './xfl-edges';
 import { renderElement } from '../core/render';
 import { AssetStore } from '../core/assets';
+import { nearestFlashRate, resample, toPcm16, pcmLength, type Pcm } from '../core/sound';
+import { parseFlv } from './flv';
 
 // ---------------- low level writers ----------------
 class Bytes {
@@ -314,6 +316,10 @@ export interface SwfOptions {
   assets: AssetStore;
   pixels(assetId: string): Promise<{ width: number; height: number; data: Uint8ClampedArray } | null>;
   sceneIndex?: number; // undefined = all scenes in sequence
+  /** Decoded library sounds (event/start/stop/stream sounds become DefineSound + StartSound). */
+  sounds?: (name: string) => Promise<Pcm | null>;
+  /** Frames of non-FLV library videos (embedded as bitmaps). */
+  videoPixels?: (name: string, frame: number) => Promise<{ width: number; height: number; data: Uint8ClampedArray } | null>;
 }
 
 interface Ctx {
@@ -328,6 +334,100 @@ interface Ctx {
   bitmapShapes: Map<string, number>;    // library item -> shape id
   pixelCache: Map<string, { width: number; height: number; data: Uint8ClampedArray } | null>;
   building: Set<string>;
+  soundIds: Map<string, { id: number; rate: number } | null>;
+  videoStreams: Map<string, { id: number; width: number; height: number; frames: number } | null>;
+  videoBitmaps: Map<string, number | null>;
+}
+
+// ---------------- sound ----------------
+const RATE_CODES: Record<number, number> = { 5512: 0, 11025: 1, 22050: 2, 44100: 3 };
+
+async function defineSound(c: Ctx, name: string): Promise<{ id: number; rate: number } | null> {
+  if (c.soundIds.has(name)) return c.soundIds.get(name)!;
+  let res: { id: number; rate: number } | null = null;
+  const src = c.opts.sounds ? await c.opts.sounds(name) : null;
+  if (src && pcmLength(src) > 0) {
+    const rate = nearestFlashRate(src.rate);
+    const pcm = resample({ rate: src.rate, channels: src.channels.slice(0, 2) }, rate);
+    const stereo = pcm.channels.length > 1;
+    const id = c.nextId++;
+    const o = new Bytes();
+    o.u16(id);
+    o.u8((3 << 4) | (RATE_CODES[rate] << 2) | (1 << 1) | (stereo ? 1 : 0)); // uncompressed little-endian PCM, 16-bit
+    o.u32(pcmLength(pcm));
+    o.bytes(toPcm16(pcm));
+    tag(c.defs, 14, o.done());
+    res = { id, rate };
+  }
+  c.soundIds.set(name, res);
+  return res;
+}
+
+async function emitFrameSounds(c: Ctx, tl: Timeline, f: number, out: Bytes) {
+  for (const l of tl.layers) {
+    if (l.type === 'folder' || l.type === 'guide') continue;
+    for (const fr of l.frames) {
+      if (fr.start !== f || !fr.sound?.name) continue;
+      const s = fr.sound;
+      const def = await defineSound(c, s.name);
+      if (!def) continue;
+      const o = new Bytes();
+      o.u16(def.id);
+      const stop = s.sync === 'stop';
+      const loops = stop ? 0 : s.loopMode === 'loop' ? 65535 : Math.max(1, Math.min(65535, s.loops || 1));
+      // stream sounds play for their frame span (approximated with an out point)
+      const outPoint = s.sync === 'stream' ? Math.round((fr.duration / c.doc.fps) * 44100) : 0;
+      let flags = 0;
+      if (stop) flags |= 0x20;
+      if (s.sync === 'start') flags |= 0x10;
+      if (loops > 1) flags |= 0x04;
+      if (outPoint) flags |= 0x02;
+      o.u8(flags);
+      if (outPoint) o.u32(outPoint);
+      if (loops > 1) o.u16(loops);
+      tag(out, 15, o.done());
+    }
+  }
+}
+
+// ---------------- video ----------------
+async function defineVideo(c: Ctx, name: string): Promise<{ id: number; width: number; height: number; frames: number } | null> {
+  if (c.videoStreams.has(name)) return c.videoStreams.get(name)!;
+  let res: { id: number; width: number; height: number; frames: number } | null = null;
+  const it = c.lib.get(name);
+  const asset = it?.kind === 'video' ? c.opts.assets.get(it.assetId) : undefined;
+  const flv = it?.kind === 'video' && it.mime === 'video/x-flv' && asset ? parseFlv(asset.bytes) : null;
+  if (flv && (flv.codec === 2 || flv.codec === 4 || flv.codec === 5) && flv.frames.length) {
+    const id = c.nextId++;
+    const o = new Bytes();
+    o.u16(id); o.u16(Math.min(65535, flv.frames.length)); o.u16(flv.width); o.u16(flv.height);
+    o.u8(0x01); // smoothing on, no deblocking
+    o.u8(flv.codec);
+    tag(c.defs, 60, o.done());
+    flv.frames.slice(0, 65535).forEach((fr, i) => {
+      const v = new Bytes();
+      v.u16(id); v.u16(i); v.bytes(fr.data);
+      tag(c.defs, 61, v.done());
+    });
+    res = { id, width: flv.width, height: flv.height, frames: flv.frames.length };
+  }
+  c.videoStreams.set(name, res);
+  return res;
+}
+
+async function videoBitmapShape(c: Ctx, name: string, frame: number, w: number, h: number): Promise<number | null> {
+  const key = `${name}#${frame}`;
+  if (c.videoBitmaps.has(key)) return c.videoBitmaps.get(key)!;
+  let id: number | null = null;
+  const px = c.opts.videoPixels ? await c.opts.videoPixels(name, frame) : null;
+  if (px) {
+    const bmp = await defineBitsLossless(c, px.width, px.height, px.data);
+    id = c.nextId++;
+    const d = [0, 0, 0, 1, w, 0, 1, w, h, 1, 0, h, 4];
+    tag(c.defs, 83, defineShape4(id, [{ fill: { kind: 'bitmap', id: bmp, matrix: { a: (20 * w) / px.width, b: 0, c: 0, d: (20 * h) / px.height, tx: 0, ty: 0 } }, stroke: null, d }]));
+  }
+  c.videoBitmaps.set(key, id);
+  return id;
 }
 
 async function defineBitmapShape(c: Ctx, itemName: string): Promise<number | null> {
@@ -479,6 +579,22 @@ async function collectElement(c: Ctx, el: Element, m: Matrix, ct: ColorTransform
       if (id !== null) out.push({ char: id, matrix: mm, ct });
       return;
     }
+    case 'video': {
+      const it = c.lib.get(el.libraryItem);
+      if (!it || it.kind !== 'video') return;
+      const vfps = it.fps || c.doc.fps;
+      const count = Math.max(1, Math.round(it.duration * vfps));
+      const idx = Math.max(0, Math.min(count - 1, Math.floor((fctx.offset / c.doc.fps) * vfps + 1e-6)));
+      const stream = await defineVideo(c, el.libraryItem);
+      if (stream) {
+        const sc: Matrix = { a: el.width / stream.width, b: 0, c: 0, d: el.height / stream.height, tx: 0, ty: 0 };
+        out.push({ char: stream.id, matrix: multiply(mm, sc), ct, ratio: Math.min(idx, stream.frames - 1) });
+      } else {
+        const sid = await videoBitmapShape(c, el.libraryItem, idx, el.width, el.height);
+        if (sid !== null) out.push({ char: sid, matrix: mm, ct });
+      }
+      return;
+    }
     case 'text': {
       const r = await defineTextShape(c, el);
       if (r) out.push({ char: r.id, matrix: multiply(mm, { a: 1 / r.scale, b: 0, c: 0, d: 1 / r.scale, tx: 0, ty: 0 }), ct: concatCT(ct, IDENTITY_CT) });
@@ -545,19 +661,22 @@ function placeObject2(o: Bytes, depth: number, item: Item, move: boolean, prev?:
   const hasCT = !prev ? !isIdentityCT(item.ct) : !ctEq(prev.ct, item.ct);
   const hasName = !move && !!item.name;
   const hasClip = !move && item.clipDepth !== undefined;
+  const hasRatio = item.ratio !== undefined && (!prev || prev.ratio !== item.ratio);
   let flags = 0;
   if (hasClip) flags |= 0x40;
   if (hasName) flags |= 0x20;
+  if (hasRatio) flags |= 0x10;
   if (hasCT) flags |= 0x08;
   if (hasMatrix) flags |= 0x04;
   if (!move) flags |= 0x02; // HasCharacter
   if (move) flags |= 0x01;
-  if (move && !hasMatrix && !hasCT) return;
+  if (move && !hasMatrix && !hasCT && !hasRatio) return;
   body.u8(flags);
   body.u16(depth);
   if (!move) body.u16(item.char);
   if (hasMatrix) body.bytes(matrixBytes(twipMatrix(item.matrix)));
   if (hasCT) body.bytes(cxformBytes(item.ct));
+  if (hasRatio) body.u16(item.ratio!);
   if (hasName) body.str(item.name!);
   if (hasClip) body.u16(item.clipDepth!);
   tag(o, 26, body.done());
@@ -571,6 +690,7 @@ function placeObject3(o: Bytes, depth: number, item: Item) {
   let f1 = 0x02 | 0x04; // character + matrix
   if (hasCT) f1 |= 0x08;
   if (item.name) f1 |= 0x20;
+  if (item.ratio !== undefined) f1 |= 0x10;
   if (item.clipDepth !== undefined) f1 |= 0x40;
   let f2 = 0;
   if (hasFilters) f2 |= 0x01;
@@ -580,6 +700,7 @@ function placeObject3(o: Bytes, depth: number, item: Item) {
   body.u16(item.char);
   body.bytes(matrixBytes(item.matrix));
   if (hasCT) body.bytes(cxformBytes(item.ct));
+  if (item.ratio !== undefined) body.u16(item.ratio);
   if (item.name) body.str(item.name);
   if (item.clipDepth !== undefined) body.u16(item.clipDepth);
   if (hasFilters) body.bytes(filterList(item.filters!));
@@ -652,6 +773,7 @@ async function emitTimelineFrames(c: Ctx, tl: Timeline, out: Bytes, ctxFor: (f: 
       else placeObject2(out, i + 1, items[i], false);
     }
     if (labels.has(f)) { const lb = new Bytes(); lb.str(labels.get(f)!); tag(out, 43, lb.done()); }
+    await emitFrameSounds(c, tl, f, out);
     if (scripts.has(f)) {
       const code = compileScript(scripts.get(f)!, labelFrames);
       if (code) tag(out, 12, code);
@@ -687,6 +809,7 @@ export async function writeSwf(doc: Doc, opts: SwfOptions): Promise<Uint8Array> 
   const c: Ctx = {
     doc, lib: indexLibrary(doc), opts, nextId: 1, defs: new Bytes(), shapeCache: new Map(), spriteIds: new Map(),
     bitmapChars: new Map(), bitmapShapes: new Map(), pixelCache: new Map(), building: new Set(),
+    soundIds: new Map(), videoStreams: new Map(), videoBitmaps: new Map(),
   };
   const scenes = opts.sceneIndex !== undefined ? [doc.scenes[opts.sceneIndex]] : doc.scenes;
   const frames = new Bytes();

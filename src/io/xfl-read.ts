@@ -1,7 +1,7 @@
 // Reads FLA (zipped XFL) documents, including files saved by Adobe Animate.
 import type {
   BitmapItem, ColorEffect, Doc, Element, Fill, Frame, Layer, LayerType, LibraryItem, Matrix, ShapeElement, ShapePath, Stroke,
-  SymbolInstance, SymbolItem, SymbolType, TextElement, Timeline, LoopMode, BlendMode, FilterDef,
+  SymbolInstance, SymbolItem, SymbolType, TextElement, Timeline, LoopMode, BlendMode, FilterDef, SoundItem, VideoItem,
 } from '../core/types';
 import { parseXml, child, kids, attr, num, bool, path, type XNode } from './xml';
 import { readZip, isZip, zlibInflate, type ZipFile } from './zip';
@@ -10,6 +10,13 @@ import { defaultColorEffect, emptyFrame, uid, itemId, nextLayerColor, IDENTITY_C
 import { identity } from '../core/matrix';
 import { ellipsePath, rectPath } from '../core/path';
 import { sniffMime, type AssetStore } from '../core/assets';
+import { transformPlanar, type PEdge, type Planar } from '../core/planar';
+import { mergeShapeElement } from '../core/merge';
+import { readAnimationCore } from './xfl-motion';
+import { isMp3, sniffAudio, parseWav, toFlashPcm, parseFlashFormat } from '../core/sound';
+import { parseFlv, splitVideoDat } from './flv';
+
+let docFps = 24;
 
 export interface ReadFlaOptions {
   assets: AssetStore;
@@ -68,7 +75,40 @@ function readStroke(n: XNode | undefined): Stroke | null {
   };
 }
 
+/** Raw (merge drawing model) shapes are already planar maps in XFL: keep their edges. */
+function readRawShape(n: XNode): ShapeElement {
+  const planar: Planar = { fills: [], strokes: [], edges: [] };
+  const fIdx = new Map<number, number>(), sIdx = new Map<number, number>();
+  for (const fs of kids(child(n, 'fills'), 'FillStyle')) {
+    const fl = readFill(fs);
+    if (fl) { planar.fills.push(fl); fIdx.set(num(fs, 'index', 0), planar.fills.length); }
+  }
+  for (const ss of kids(child(n, 'strokes'), 'StrokeStyle')) {
+    const st = readStroke(ss);
+    if (st) { planar.strokes.push(st); sIdx.set(num(ss, 'index', 0), planar.strokes.length); }
+  }
+  for (const e of kids(child(n, 'edges'), 'Edge')) {
+    const s = attr(e, 'edges');
+    if (!s) continue;
+    const f0 = fIdx.get(num(e, 'fillStyle0', 0)) ?? 0, f1 = fIdx.get(num(e, 'fillStyle1', 0)) ?? 0, st = sIdx.get(num(e, 'strokeStyle', 0)) ?? 0;
+    if (f0 === f1 && !st) continue;
+    for (const c of parseEdges(s)) {
+      for (const g of c) {
+        if (Math.abs(g.x - g.x0) < 1e-9 && Math.abs(g.y - g.y0) < 1e-9 && g.t === 'L') continue;
+        const edge: PEdge = g.t === 'L'
+          ? [g.x0, g.y0, (g.x0 + g.x) / 2, (g.y0 + g.y) / 2, g.x, g.y, 0, f0, f1, st]
+          : [g.x0, g.y0, g.cx, g.cy, g.x, g.y, 1, f0, f1, st];
+        planar.edges.push(edge);
+      }
+    }
+  }
+  const m = readMatrix(child(n, 'matrix'));
+  const ident = m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1 && m.tx === 0 && m.ty === 0;
+  return mergeShapeElement(uid(), ident ? planar : transformPlanar(planar, m));
+}
+
 function readShape(n: XNode): ShapeElement {
+  if (!bool(n, 'isDrawingObject', false)) return readRawShape(n);
   const fills = new Map<number, Fill>();
   const strokes = new Map<number, Stroke>();
   for (const fs of kids(child(n, 'fills'), 'FillStyle')) {
@@ -230,6 +270,11 @@ function readElement(n: XNode, warn: (s: string) => void): Element | null {
     }
     case 'DOMBitmapInstance':
       return { type: 'bitmap', id: uid(), matrix: readMatrix(child(n, 'matrix')), libraryItem: attr(n, 'libraryItemName') };
+    case 'DOMVideoInstance':
+      return {
+        type: 'video', id: uid(), matrix: readMatrix(child(n, 'matrix')), libraryItem: attr(n, 'libraryItemName'),
+        width: num(n, 'frameRight', 6400) / 20, height: num(n, 'frameBottom', 4800) / 20,
+      };
     case 'DOMStaticText':
     case 'DOMDynamicText':
     case 'DOMInputText':
@@ -247,8 +292,17 @@ function readFrame(n: XNode, warn: (s: string) => void): Frame {
   const fr = emptyFrame(num(n, 'index', 0), Math.max(1, num(n, 'duration', 1)));
   const tt = attr(n, 'tweenType', '');
   fr.tween = tt === 'motion' ? 'classic' : tt === 'shape' ? 'shape' : 'none';
-  if (tt === 'motion object') warn('Motion tweens (new-style) are shown as static frames; use classic tweens.');
-  fr.ease = num(n, 'acceleration', 0);
+  if (tt === 'motion object') {
+    const core = path(n, 'motionObjectXML/AnimationCore');
+    if (core) {
+      fr.tween = 'motion';
+      fr.motion = readAnimationCore(core, docFps);
+      // the Properties panel ease maps to the first time map
+      const tm = fr.motion.timeMaps[0];
+      if (tm && tm.type === 'Quadratic') fr.ease = tm.strength;
+    }
+  }
+  if (fr.tween !== 'motion') fr.ease = num(n, 'acceleration', 0);
   const rot = attr(n, 'motionTweenRotate', 'auto');
   fr.rotate = rot === 'clockwise' ? 'cw' : rot === 'counter-clockwise' ? 'ccw' : rot === 'none' ? 'none' : 'auto';
   fr.rotateTimes = num(n, 'motionTweenRotateTimes', 0);
@@ -257,6 +311,16 @@ function readFrame(n: XNode, warn: (s: string) => void): Frame {
   fr.labelType = lt === 'comment' ? 'comment' : lt === 'anchor' ? 'anchor' : 'name';
   const script = path(n, 'Actionscript/script');
   if (script) fr.script = script.text;
+  const snd = attr(n, 'soundName', '');
+  if (snd) {
+    const sync = attr(n, 'soundSync', 'event');
+    fr.sound = {
+      name: snd,
+      sync: sync === 'start' || sync === 'stop' || sync === 'stream' ? sync : 'event',
+      loopMode: attr(n, 'soundLoopMode', 'repeat') === 'loop' ? 'loop' : 'repeat',
+      loops: Math.max(1, num(n, 'soundLoop', 1)),
+    };
+  }
   fr.elements = kids(child(n, 'elements')).map((e) => readElement(e, warn)).filter((e): e is Element => !!e);
   return fr;
 }
@@ -356,6 +420,52 @@ export async function readFla(bytes: Uint8Array, opts: ReadFlaOptions): Promise<
   return readXfl(readZip(bytes), opts);
 }
 
+async function mediaBytes(zip: ZipFile, prefix: string, dat: string, name: string): Promise<Uint8Array | null> {
+  if (dat && zip.has(`${prefix}bin/${dat}`)) return zip.read(`${prefix}bin/${dat}`);
+  if (name && zip.has(`${prefix}LIBRARY/${name}`)) return zip.read(`${prefix}LIBRARY/${name}`);
+  return null;
+}
+
+async function readSoundItem(n: XNode, zip: ZipFile, prefix: string, opts: ReadFlaOptions, warn: (s: string) => void): Promise<SoundItem | null> {
+  const name = attr(n, 'name');
+  let bytes = await mediaBytes(zip, prefix, attr(n, 'soundDataHRef'), attr(n, 'href', name)).catch(() => null);
+  if (!bytes) { warn(`Sound "${name}" has no data and was skipped.`); return null; }
+  let format = attr(n, 'format', '44kHz 16bit Stereo');
+  let codec: SoundItem['codec'];
+  let sampleCount = num(n, 'sampleCount', 0);
+  if (isMp3(bytes)) {
+    // Animate appends a PCM preview cache after the MP3 frames
+    const len = num(n, 'dataLength', 0);
+    if (len > 0 && len < bytes.length) bytes = bytes.slice(0, len);
+    codec = 'mp3';
+  } else if (sniffAudio(bytes) === 'audio/wav') {
+    const pcm = parseWav(bytes);
+    if (!pcm) { warn(`Sound "${name}" could not be decoded.`); return null; }
+    const f = toFlashPcm(pcm);
+    bytes = f.bytes; format = f.format; sampleCount = f.sampleCount; codec = 'pcm';
+  } else codec = parseFlashFormat(format).adpcm ? 'adpcm' : 'pcm';
+  const asset = opts.assets.addRaw(bytes, codec === 'mp3' ? 'audio/mpeg' : 'audio/x-flash-pcm');
+  return { kind: 'sound', name, itemID: attr(n, 'itemID', itemId()), assetId: asset.id, codec, format, sampleCount };
+}
+
+async function readVideoItem(n: XNode, zip: ZipFile, prefix: string, opts: ReadFlaOptions, warn: (s: string) => void): Promise<VideoItem | null> {
+  const name = attr(n, 'name');
+  const bytes = await mediaBytes(zip, prefix, attr(n, 'videoDataHRef'), name).catch(() => null);
+  if (!bytes) { warn(`Video "${name}" has no data and was skipped.`); return null; }
+  const { prefix: pre, stream, mime } = splitVideoDat(bytes);
+  const flv = mime === 'video/x-flv' ? parseFlv(stream) : null;
+  const asset = opts.assets.addRaw(stream.slice(), mime);
+  return {
+    kind: 'video', name, itemID: attr(n, 'itemID', itemId()), assetId: asset.id, mime,
+    width: num(n, 'width', 0) || flv?.width || 320,
+    height: num(n, 'height', 0) || flv?.height || 240,
+    fps: num(n, 'fps', 0) || flv?.fps || docFps,
+    duration: num(n, 'length', 0) || flv?.duration || 0,
+    videoType: attr(n, 'videoType', '') || undefined,
+    datPrefix: pre.length ? [...pre] : undefined,
+  };
+}
+
 export async function readXfl(zip: ZipFile, opts: ReadFlaOptions): Promise<ReadResult> {
   const warnings = new Set<string>();
   const warn = (s: string) => warnings.add(s);
@@ -363,6 +473,7 @@ export async function readXfl(zip: ZipFile, opts: ReadFlaOptions): Promise<ReadR
   if (!domName) throw new Error('DOMDocument.xml not found in FLA.');
   const prefix = domName.slice(0, domName.length - 'DOMDocument.xml'.length);
   const dom = parseXml(await zip.readText(domName));
+  docFps = num(dom, 'frameRate', 24) || 24;
   const doc: Doc = {
     width: num(dom, 'width', 550),
     height: num(dom, 'height', 400),
@@ -377,8 +488,10 @@ export async function readXfl(zip: ZipFile, opts: ReadFlaOptions): Promise<ReadR
   }
   // bitmaps
   for (const bn of kids(child(dom, 'media'))) {
+    if (bn.name === 'DOMSoundItem') { const it = await readSoundItem(bn, zip, prefix, opts, warn); if (it) library.push(it); continue; }
+    if (bn.name === 'DOMVideoItem') { const it = await readVideoItem(bn, zip, prefix, opts, warn); if (it) library.push(it); continue; }
     if (bn.name !== 'DOMBitmapItem') {
-      warn(`Media item <${bn.name}> (sound/video) is not supported yet and was skipped.`);
+      warn(`Media item <${bn.name}> is not supported and was skipped.`);
       continue;
     }
     const name = attr(bn, 'name');

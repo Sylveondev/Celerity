@@ -15,11 +15,24 @@ import { platform, isElectron } from './platform';
 import { modal, row, progressDialog, alertDialog } from './dialogs';
 import { h, numField, select, checkbox, toast, clear } from './dom';
 import { assetPixels } from './fileops';
+import { video } from './video';
+import { audio } from './audio';
 
 const I: Matrix = { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
 
 function env(playback = true, includeHidden = true): RenderEnv {
-  return { lib: store.lib, assets: store.assets, playback, includeHidden, showGuides: false, outlines: false };
+  return { lib: store.lib, assets: store.assets, playback, includeHidden, showGuides: false, outlines: false, videoFrame: (n, o) => video.frameSync(n, o) };
+}
+
+/** Renders until every embedded video frame it needs has been decoded. */
+async function settled<T>(render: () => T): Promise<T> {
+  video.consumeMissed();
+  let r = render();
+  for (let i = 0; i < 4 && video.consumeMissed(); i++) {
+    await video.settle();
+    r = render();
+  }
+  return r;
 }
 
 function baseName() { return store.fileName.replace(/\.fla$/i, ''); }
@@ -143,20 +156,41 @@ async function runMediaExport(v: { format: MediaFormat; scale: number; from: num
   const f0 = Math.max(0, Math.min(len - 1, Math.round(v.from) - 1));
   const f1 = Math.max(f0, Math.min(len - 1, Math.round(v.to) - 1));
   const scale = v.scale / 100;
-  const W = Math.max(1, Math.round(store.doc.width * scale)), H = Math.max(1, Math.round(store.doc.height * scale));
   const transparent = v.transparent && v.format !== 'mp4';
-  const base = baseName();
-  const total = f1 - f0 + 1;
+  await encodeFrames({
+    format: v.format, hasFfmpeg, base: baseName(), quality: v.quality, loop: v.loop,
+    width: Math.max(1, Math.round(store.doc.width * scale)), height: Math.max(1, Math.round(store.doc.height * scale)),
+    total: f1 - f0 + 1,
+    frame: (i) => settled(() => sceneFrame(f0 + i, scale, transparent, v.includeHidden)),
+    soundtrack: () => audio.soundtrack(store.scene(), f0, f1, store.doc.fps),
+  });
+}
 
-  if (v.format === 'png-seq') {
+interface FrameSource {
+  format: MediaFormat;
+  hasFfmpeg: boolean;
+  base: string;
+  width: number; height: number;
+  total: number;
+  quality: number; loop: number;
+  frame(i: number): Promise<ImageData>;
+  /** PNG sequence file names (default `${base}_0001.png`). */
+  fileName?(i: number): string;
+  soundtrack?(): Promise<Uint8Array | null>;
+}
+
+/** Encodes rendered frames as a PNG sequence, GIF or video (ffmpeg, or MediaRecorder WebM in the browser). */
+async function encodeFrames(src: FrameSource) {
+  const { format, base, width: W, height: H, total } = src;
+  const nameOf = src.fileName ?? ((i: number) => `${base}_${String(i + 1).padStart(4, '0')}.png`);
+  if (format === 'png-seq') {
     const files: { name: string; data: Uint8Array }[] = [];
     const prog = progressDialog('Exporting PNG sequence');
     try {
-      for (let f = f0; f <= f1; f++) {
+      for (let i = 0; i < total; i++) {
         if (prog.cancelled()) return;
-        const img = sceneFrame(f, scale, transparent, v.includeHidden);
-        files.push({ name: `${base}_${String(f - f0 + 1).padStart(4, '0')}.png`, data: await imageDataToBlob(img, 'image/png') });
-        prog.set((f - f0 + 1) / total, `Frame ${f - f0 + 1} of ${total}`);
+        files.push({ name: nameOf(i), data: await imageDataToBlob(await src.frame(i), 'image/png') });
+        prog.set((i + 1) / total, `Frame ${i + 1} of ${total}`);
       }
       if (isElectron) {
         const dir = await platform.chooseDir('Choose a folder for the PNG sequence');
@@ -169,40 +203,45 @@ async function runMediaExport(v: { format: MediaFormat; scale: number; from: num
     return;
   }
 
-  if (v.format === 'gif' && !hasFfmpeg) {
+  if (format === 'gif' && !src.hasFfmpeg) {
     const path = await platform.chooseSavePath(`${base}.gif`, [{ name: 'GIF', extensions: ['gif'] }], 'Export Animated GIF');
     if (!path) return;
     const prog = progressDialog('Exporting animated GIF');
     try {
       const frames: { data: Uint8ClampedArray }[] = [];
-      for (let f = f0; f <= f1; f++) {
+      let transparent = false;
+      for (let i = 0; i < total; i++) {
         if (prog.cancelled()) return;
-        frames.push({ data: sceneFrame(f, scale, transparent, v.includeHidden).data });
-        prog.set(((f - f0 + 1) / total) * 0.7, `Rendering frame ${f - f0 + 1} of ${total}`);
-        if ((f - f0) % 8 === 0) await new Promise((r) => setTimeout(r));
+        const img = await src.frame(i);
+        if (!transparent) for (let k = 3; k < img.data.length; k += 4 * 97) if (img.data[k] < 255) { transparent = true; break; }
+        frames.push({ data: img.data });
+        prog.set(((i + 1) / total) * 0.7, `Rendering frame ${i + 1} of ${total}`);
+        if (i % 8 === 0) await new Promise((r) => setTimeout(r));
       }
       prog.set(0.8, 'Encoding…');
       await new Promise((r) => setTimeout(r));
-      const gif = encodeGif(W, H, frames, store.doc.fps, { loop: v.loop, transparent });
+      const gif = encodeGif(W, H, frames, store.doc.fps, { loop: src.loop, transparent });
       await platform.writeTo(path, gif);
       toast(`Exported ${platform.basename(path)}`, 'ok');
     } finally { prog.close(); }
     return;
   }
 
-  if (hasFfmpeg && platform.video) {
-    const ext = v.format;
+  if (src.hasFfmpeg && platform.video) {
+    const ext = format;
     const path = await platform.chooseSavePath(`${base}.${ext}`, [{ name: ext.toUpperCase(), extensions: [ext] }], 'Export Video');
     if (!path) return;
     const prog = progressDialog(`Exporting ${ext.toUpperCase()}`);
     let id = 0;
     try {
-      id = await platform.video.start({ file: path, width: W, height: H, fps: store.doc.fps, format: ext, quality: v.quality, loop: v.loop });
-      for (let f = f0; f <= f1; f++) {
+      prog.set(0, 'Mixing sound…');
+      const audioData = ext === 'gif' || !src.soundtrack ? null : await src.soundtrack();
+      id = await platform.video.start({ file: path, width: W, height: H, fps: store.doc.fps, format: ext, quality: src.quality, loop: src.loop, audioData: audioData ?? undefined });
+      for (let i = 0; i < total; i++) {
         if (prog.cancelled()) { await platform.video.cancel(id); return; }
-        const img = sceneFrame(f, scale, transparent, v.includeHidden);
+        const img = await src.frame(i);
         await platform.video.frame(id, new Uint8Array(img.data.buffer, img.data.byteOffset, img.data.byteLength));
-        prog.set((f - f0 + 1) / total, `Frame ${f - f0 + 1} of ${total}`);
+        prog.set((i + 1) / total, `Frame ${i + 1} of ${total}`);
       }
       prog.set(1, 'Finishing…');
       const r = await platform.video.finish(id);
@@ -216,28 +255,42 @@ async function runMediaExport(v: { format: MediaFormat; scale: number; from: num
   }
 
   // Browser fallback: WebM via MediaRecorder (real-time)
-  if (v.format === 'webm' || v.format === 'mp4' || v.format === 'mov') {
+  if (format === 'webm' || format === 'mp4' || format === 'mov') {
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d')!;
     const stream = canvas.captureStream(0);
     const track = stream.getVideoTracks()[0] as MediaStreamTrack & { requestFrame?: () => void };
-    const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m)) ?? 'video/webm';
-    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2e6 + v.quality * 1e5 });
+    // soundtrack: played into the recording in real time
+    const wav = src.soundtrack ? await src.soundtrack() : null;
+    const actx = wav ? audio.context() : null;
+    let soundSrc: AudioBufferSourceNode | null = null;
+    if (wav && actx) {
+      const buf = await actx.decodeAudioData(wav.slice().buffer as ArrayBuffer);
+      const dest = actx.createMediaStreamDestination();
+      soundSrc = actx.createBufferSource();
+      soundSrc.buffer = buf;
+      soundSrc.connect(dest);
+      stream.addTrack(dest.stream.getAudioTracks()[0]);
+    }
+    const mime = (soundSrc ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus'] : []).concat(['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']).find((m) => MediaRecorder.isTypeSupported(m)) ?? 'video/webm';
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2e6 + src.quality * 1e5 });
     const chunks: Blob[] = [];
     rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
     const prog = progressDialog('Recording WebM (real time)');
     const done = new Promise<void>((r) => { rec.onstop = () => r(); });
     rec.start();
+    if (soundSrc && actx) { await actx.resume().catch(() => {}); soundSrc.start(); }
     const frameMs = 1000 / store.doc.fps;
-    for (let f = f0; f <= f1; f++) {
+    for (let i = 0; i < total; i++) {
       if (prog.cancelled()) break;
       const t0 = performance.now();
-      ctx.putImageData(sceneFrame(f, scale, transparent, v.includeHidden), 0, 0);
+      ctx.putImageData(await src.frame(i), 0, 0);
       track.requestFrame?.();
-      prog.set((f - f0 + 1) / total, `Frame ${f - f0 + 1} of ${total}`);
+      prog.set((i + 1) / total, `Frame ${i + 1} of ${total}`);
       await new Promise((r) => setTimeout(r, Math.max(0, frameMs - (performance.now() - t0))));
     }
+    try { soundSrc?.stop(); } catch { /* ended */ }
     rec.stop();
     await done;
     prog.close();
@@ -377,6 +430,233 @@ export function exportSpriteSheetDialog(symbolName?: string) {
   });
 }
 
+// ---------------- Export several symbols together ----------------
+type MultiOutput = 'sheet' | 'png-seq' | 'video';
+
+interface MultiOptions {
+  names: string[];
+  output: MultiOutput;
+  arrange: 'sequence' | 'grid';
+  videoFormat: Exclude<MediaFormat, 'png-seq'>;
+  scale: number;
+  background: 'transparent' | 'stage';
+  padding: number;
+  quality: number;
+  // sprite sheet
+  format: SheetFormat | 'none';
+  algorithm: SheetAlgorithm;
+  trim: boolean; stack: boolean; pow2: boolean;
+}
+
+interface MultiSource { name: string; tl: Timeline; area: Rect; len: number; registration: { x: number; y: number } }
+
+function multiSources(names: string[]): MultiSource[] {
+  const out: MultiSource[] = [];
+  for (const n of names) {
+    const s = sourceTimeline(n);
+    if (s) out.push({ name: s.name, tl: s.tl, area: s.area, len: timelineFrameCount(s.tl), registration: s.registration });
+  }
+  return out;
+}
+
+/** Layout of a combined frame: cell size and positions of each symbol. */
+function multiLayout(srcs: MultiSource[], o: MultiOptions) {
+  const k = o.scale / 100, pad = Math.max(0, Math.round(o.padding));
+  const cw = Math.max(1, ...srcs.map((s) => Math.ceil(s.area.w * k)));
+  const ch = Math.max(1, ...srcs.map((s) => Math.ceil(s.area.h * k)));
+  if (o.arrange === 'sequence') return { W: cw + pad * 2, H: ch + pad * 2, cols: 1, cw, ch, pad, total: srcs.reduce((a, s) => a + s.len, 0) };
+  const cols = Math.ceil(Math.sqrt(srcs.length));
+  const rows = Math.ceil(srcs.length / cols);
+  return { W: cols * cw + (cols + 1) * pad, H: rows * ch + (rows + 1) * pad, cols, cw, ch, pad, total: Math.max(1, ...srcs.map((s) => s.len)) };
+}
+
+/** Renders combined frame i: one symbol after another, or all side by side (shorter ones loop). */
+function multiFrame(srcs: MultiSource[], o: MultiOptions, i: number): ImageData {
+  const L = multiLayout(srcs, o);
+  const k = o.scale / 100;
+  const c = new OffscreenCanvas(L.W, L.H);
+  const ctx = c.getContext('2d')!;
+  if (o.background === 'stage') { ctx.fillStyle = store.doc.background; ctx.fillRect(0, 0, L.W, L.H); }
+  const draw = (s: MultiSource, f: number, cx: number, cy: number) => {
+    const img = renderArea(s.tl, f, { x: s.area.x, y: s.area.y }, s.area.w, s.area.h, k, null);
+    const tmp = new OffscreenCanvas(img.width, img.height);
+    tmp.getContext('2d')!.putImageData(img, 0, 0);
+    ctx.drawImage(tmp, Math.round(cx + (L.cw - img.width) / 2), Math.round(cy + (L.ch - img.height) / 2));
+  };
+  if (o.arrange === 'sequence') {
+    let rest = i;
+    for (const s of srcs) {
+      if (rest < s.len) { draw(s, rest, L.pad, L.pad); break; }
+      rest -= s.len;
+    }
+  } else {
+    srcs.forEach((s, n) => draw(s, i % s.len, L.pad + (n % L.cols) * (L.cw + L.pad), L.pad + Math.floor(n / L.cols) * (L.ch + L.pad)));
+  }
+  return ctx.getImageData(0, 0, L.W, L.H);
+}
+
+async function buildMultiSheet(srcs: MultiSource[], o: MultiOptions, onProgress?: (p: number) => void) {
+  const k = o.scale / 100;
+  const bg = o.background === 'stage' ? store.doc.background : null;
+  const images: ImageData[] = [];
+  const frames: SheetFrame[] = [];
+  const total = srcs.reduce((a, s) => a + s.len, 0);
+  for (const s of srcs) {
+    for (let f = 0; f < s.len; f++) {
+      const img = await settled(() => renderArea(s.tl, f, { x: s.area.x, y: s.area.y }, s.area.w, s.area.h, k, bg));
+      images.push(img);
+      const t = o.trim && !bg ? trimBounds(img.data, img.width, img.height) : { x: 0, y: 0, w: img.width, h: img.height };
+      frames.push({
+        name: `${s.name}${String(f).padStart(4, '0')}`, anim: s.name, reg: { x: s.registration.x * k, y: s.registration.y * k },
+        srcW: img.width, srcH: img.height, trimX: t.x, trimY: t.y, w: t.w, h: t.h, hash: o.stack ? hashPixels(img.data) : `${s.name}:${f}`,
+      });
+      onProgress?.(frames.length / total);
+    }
+  }
+  const size = packFrames(frames, { algorithm: o.algorithm, padding: o.padding, border: 2, columns: 0, maxSize: 8192, powerOfTwo: o.pow2, stack: o.stack });
+  const sheet = new OffscreenCanvas(size.width, size.height);
+  const ctx = sheet.getContext('2d')!;
+  if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, size.width, size.height); }
+  frames.forEach((fr, i) => {
+    if (fr.dupOf !== undefined) return;
+    ctx.putImageData(images[i], fr.x! - fr.trimX, fr.y! - fr.trimY, fr.trimX, fr.trimY, fr.w, fr.h);
+  });
+  return { sheet, frames, size };
+}
+
+/** File › Export › Export Selected Symbols: one sprite sheet, PNG sequence or video for several symbols. */
+export async function exportSymbolsDialog(preselect: string[]) {
+  const symbols = store.doc.library.filter((i): i is SymbolItem => i.kind === 'symbol');
+  if (!symbols.length) { toast('The library has no symbols to export.', 'error'); return; }
+  const ffmpeg = platform.video ? await platform.video.probe().catch(() => ({ ok: false })) : { ok: false };
+  const o: MultiOptions = {
+    names: preselect.filter((n) => symbols.some((s) => s.name === n)), output: 'sheet', arrange: 'sequence',
+    videoFormat: ffmpeg.ok ? 'mp4' : isElectron ? 'gif' : 'webm', scale: 100, background: 'transparent', padding: 2, quality: 80,
+    format: 'json', algorithm: 'packed', trim: true, stack: true, pow2: false,
+  };
+  if (!o.names.length) o.names = [symbols[0].name];
+  const info = h('div', { class: 'hint' });
+  const preview = h('canvas', { class: 'sheet-preview' }) as HTMLCanvasElement;
+  let timer = 0;
+  const refresh = () => {
+    clearTimeout(timer);
+    timer = window.setTimeout(async () => {
+      const srcs = multiSources(o.names);
+      if (!srcs.length) { info.textContent = 'Choose at least one symbol.'; return; }
+      try {
+        let img: CanvasImageSource; let w: number; let hh: number;
+        if (o.output === 'sheet') {
+          const r = await buildMultiSheet(srcs, o);
+          img = r.sheet; w = r.size.width; hh = r.size.height;
+          info.textContent = `${w} × ${hh} px sheet · ${r.frames.length} frames from ${srcs.length} symbol(s)`;
+        } else {
+          const L = multiLayout(srcs, o);
+          const f = await settled(() => multiFrame(srcs, o, 0));
+          const c = new OffscreenCanvas(f.width, f.height); c.getContext('2d')!.putImageData(f, 0, 0);
+          img = c; w = L.W; hh = L.H;
+          info.textContent = `${L.W} × ${L.H} px · ${L.total} frames (${(L.total / store.doc.fps).toFixed(2)} s) · ${o.arrange === 'sequence' ? 'one after another' : 'side by side'}`;
+        }
+        const k = Math.min(1, 360 / w, 300 / hh);
+        preview.width = Math.max(1, Math.round(w * k)); preview.height = Math.max(1, Math.round(hh * k));
+        const pc = preview.getContext('2d')!;
+        pc.clearRect(0, 0, preview.width, preview.height);
+        pc.drawImage(img, 0, 0, preview.width, preview.height);
+      } catch (e) { info.textContent = (e as Error).message; }
+    }, 150);
+  };
+  const list = h('div', { class: 'sym-checklist' }, ...symbols.map((s) => checkbox(s.name, o.names.includes(s.name), (on) => {
+    o.names = on ? [...o.names, s.name] : o.names.filter((n) => n !== s.name);
+    o.names = symbols.map((x) => x.name).filter((n) => o.names.includes(n));
+    refresh();
+  })));
+  const sheetRows = h('div', { class: 'form' },
+    row('Data format', select(o.format, [['json', 'JSON (Hash)'], ['json-array', 'JSON-Array'], ['phaser3', 'Phaser 3'], ['starling', 'Starling / Sparrow XML'], ['easeljs', 'EaselJS'], ['cocos2d', 'cocos2d-x (plist)'], ['css', 'CSS'], ['none', 'None (image only)']], (x) => { o.format = x; })),
+    row('Algorithm', select(o.algorithm, [['packed', 'Packed (MaxRects)'], ['basic', 'Basic (grid)']], (x) => { o.algorithm = x; refresh(); })),
+    row('', checkbox('Trim transparent edges', o.trim, (x) => { o.trim = x; refresh(); })),
+    row('', checkbox('Stack identical frames', o.stack, (x) => { o.stack = x; refresh(); })),
+    row('', checkbox('Power-of-two size', o.pow2, (x) => { o.pow2 = x; refresh(); })));
+  const arrangeRow = row('Arrange', select(o.arrange, [['sequence', 'One after another'], ['grid', 'Side by side (all at once)']], (x) => { o.arrange = x; refresh(); }));
+  const videoRow = row('Format', select(o.videoFormat, [
+    ['mp4', `MP4 (H.264)${ffmpeg.ok ? '' : ' — needs ffmpeg'}`], ['mov', `MOV (ProRes 4444, alpha)${ffmpeg.ok ? '' : ' — needs ffmpeg'}`], ['webm', 'WebM (VP9, alpha)'], ['gif', 'Animated GIF'],
+  ], (x) => { o.videoFormat = x; }));
+  const update = () => {
+    sheetRows.style.display = o.output === 'sheet' ? '' : 'none';
+    arrangeRow.style.display = o.output === 'sheet' ? 'none' : '';
+    videoRow.style.display = o.output === 'video' ? '' : 'none';
+  };
+  update();
+  const body = h('div', { class: 'sheet-dialog' },
+    h('div', { class: 'form' },
+      row('Symbols', list),
+      row('Export as', select(o.output, [['sheet', 'One sprite sheet'], ['png-seq', 'PNG sequence'], ['video', 'Video / GIF']], (x) => { o.output = x; update(); refresh(); })),
+      arrangeRow, videoRow,
+      row('Scale', numField({ value: o.scale, min: 1, max: 800, digits: 0, onChange: (x) => { o.scale = x; refresh(); } }), '%'),
+      row('Padding', numField({ value: o.padding, min: 0, max: 128, digits: 0, onChange: (x) => { o.padding = x; refresh(); } }), 'px'),
+      row('Background', select(o.background, [['transparent', 'Transparent'], ['stage', 'Stage color']], (x) => { o.background = x; refresh(); })),
+      sheetRows,
+    ),
+    h('div', { class: 'sheet-preview-wrap' }, h('div', { class: 'checker' }, preview), info),
+  );
+  refresh();
+  modal({
+    title: 'Export Selected Symbols', width: 860, body,
+    buttons: [{ label: 'Cancel' }, {
+      label: 'Export', primary: true, onClick: async () => {
+        const srcs = multiSources(o.names);
+        if (!srcs.length) { toast('Choose at least one symbol.', 'error'); return false; }
+        await runMultiExport(srcs, o, !!ffmpeg.ok);
+      },
+    }],
+  });
+}
+
+export async function runMultiExport(srcs: MultiSource[], o: MultiOptions, hasFfmpeg: boolean) {
+  const base = srcs.length === 1 ? srcs[0].name : `${baseName()}_symbols`;
+  if (o.output === 'sheet') {
+    const prog = progressDialog('Building sprite sheet');
+    let r: Awaited<ReturnType<typeof buildMultiSheet>>;
+    try { r = await buildMultiSheet(srcs, o, (p) => prog.set(p * 0.9, 'Rendering frames…')); } finally { prog.close(); }
+    const png = new Uint8Array(await (await r.sheet.convertToBlob({ type: 'image/png' })).arrayBuffer());
+    const path = await platform.chooseSavePath(`${base}.png`, [{ name: 'PNG', extensions: ['png'] }], 'Export Sprite Sheet');
+    if (!path) return;
+    const imageName = platform.basename(path);
+    await platform.writeTo(path, png);
+    if (o.format !== 'none') {
+      const data = sheetData(o.format, r.frames, { image: imageName, width: r.size.width, height: r.size.height, fps: store.doc.fps, scale: o.scale / 100, animationName: base, registration: { x: 0, y: 0 } });
+      await platform.writeSiblings(path, [{ name: imageName.replace(/\.png$/i, '') + '.' + data.ext, data: data.text }]);
+    }
+    toast(`Exported ${srcs.length} symbol(s) to ${imageName}`, 'ok');
+    return;
+  }
+  const L = multiLayout(srcs, o);
+  // PNG sequences in "one after another" mode keep each symbol's own frame numbers
+  const starts: number[] = [];
+  srcs.reduce((a, s) => { starts.push(a); return a + s.len; }, 0);
+  const fileName = (i: number) => {
+    if (o.arrange !== 'sequence') return `${base}_${String(i + 1).padStart(4, '0')}.png`;
+    let k = srcs.length - 1;
+    while (k > 0 && starts[k] > i) k--;
+    return `${srcs[k].name}_${String(i - starts[k] + 1).padStart(4, '0')}.png`;
+  };
+  await encodeFrames({
+    format: o.output === 'png-seq' ? 'png-seq' : o.videoFormat, hasFfmpeg, base, quality: o.quality, loop: 0,
+    width: o.output === 'video' && o.videoFormat === 'mp4' ? L.W + (L.W % 2) : L.W, height: o.output === 'video' && o.videoFormat === 'mp4' ? L.H + (L.H % 2) : L.H,
+    total: L.total,
+    frame: async (i) => {
+      const img = await settled(() => multiFrame(srcs, o.output === 'video' && o.videoFormat === 'mp4' && o.background === 'transparent' ? { ...o, background: 'stage' } : o, i));
+      if (o.output === 'video' && o.videoFormat === 'mp4' && (img.width % 2 || img.height % 2)) {
+        const c = new OffscreenCanvas(img.width + (img.width % 2), img.height + (img.height % 2));
+        const x = c.getContext('2d')!;
+        x.fillStyle = store.doc.background; x.fillRect(0, 0, c.width, c.height);
+        x.putImageData(img, 0, 0);
+        return x.getImageData(0, 0, c.width, c.height);
+      }
+      return img;
+    },
+    fileName,
+  });
+}
+
 // ---------------- Publish SWF ----------------
 export function publishDialog() {
   const v = { version: 32, compress: true, includeHidden: true, html: true };
@@ -395,7 +675,11 @@ export function publishDialog() {
 
 export async function publishSwf(v = { version: 32, compress: true, includeHidden: true, html: true }) {
   try {
-    const bytes = await writeSwf(store.doc, { version: v.version, compress: v.compress, includeHidden: v.includeHidden, assets: store.assets, pixels: (id) => assetPixels(id) });
+    const bytes = await writeSwf(store.doc, {
+      version: v.version, compress: v.compress, includeHidden: v.includeHidden, assets: store.assets, pixels: (id) => assetPixels(id),
+      sounds: async (name) => { const it = store.lib.get(name); return it?.kind === 'sound' ? audio.decode(it) : null; },
+      videoPixels: (name, frame) => video.pixels(name, frame),
+    });
     const name = `${baseName()}.swf`;
     const path = await platform.saveAs(name, [{ name: 'Flash Movie', extensions: ['swf'] }], bytes, 'Publish SWF');
     if (!path) return;
@@ -418,12 +702,16 @@ export function testMovie() {
   const canvas = h('canvas', { class: 'test-canvas' }) as HTMLCanvasElement;
   const status = h('span', { class: 'dim' });
   const playBtn = h('button', null, 'Pause');
-  const wrap = h('div', { class: 'test-movie' }, canvas, h('div', { class: 'test-bar' }, playBtn, h('button', { onclick: () => { frame = 0; elapsed = 0; playing = true; playBtn.textContent = 'Pause'; } }, 'Restart'), status));
+  const wrap = h('div', { class: 'test-movie' }, canvas, h('div', { class: 'test-bar' }, playBtn, h('button', { onclick: () => { frame = 0; elapsed = 0; playing = true; playBtn.textContent = 'Pause'; void audio.playTimeline(tl, 0, d.fps); } }, 'Restart'), status));
   const labels = new Map(labelsOf(tl).map((l) => [l.label, l.frame]));
   const scripts = new Map<number, string>();
   for (const l of tl.layers) for (const f of l.frames) if (f.script.trim()) scripts.set(f.start, (scripts.get(f.start) ?? '') + '\n' + f.script);
   let frame = 0, elapsed = 0, playing = true, raf = 0, last = performance.now(), acc = 0;
-  playBtn.addEventListener('click', () => { playing = !playing; playBtn.textContent = playing ? 'Pause' : 'Play'; });
+  playBtn.addEventListener('click', () => {
+    playing = !playing;
+    playBtn.textContent = playing ? 'Pause' : 'Play';
+    if (playing) void audio.playTimeline(tl, frame, d.fps); else audio.stop();
+  });
   const runScript = (f: number) => {
     const s = scripts.get(f);
     if (!s) return;
@@ -463,7 +751,7 @@ export function testMovie() {
       elapsed++; // movie clips keep playing even when the main timeline is stopped
       if (playing) {
         frame++;
-        if (frame >= len) frame = 0;
+        if (frame >= len) { frame = 0; void audio.playTimeline(tl, 0, d.fps); }
         runScript(frame);
       }
       advanced = true;
@@ -473,7 +761,8 @@ export function testMovie() {
     raf = requestAnimationFrame(tick);
   };
   runScript(0);
-  const m = modal({ title: `Test Movie — ${store.fileName}`, body: wrap, width: 1400, className: 'test-modal', buttons: [{ label: 'Close', primary: true }], onClose: () => cancelAnimationFrame(raf) });
+  void audio.playTimeline(tl, 0, d.fps);
+  const m = modal({ title: `Test Movie — ${store.fileName}`, body: wrap, width: 1400, className: 'test-modal', buttons: [{ label: 'Close', primary: true }], onClose: () => { cancelAnimationFrame(raf); audio.stop(); } });
   void m;
   requestAnimationFrame(() => { draw(); raf = requestAnimationFrame(tick); });
 }

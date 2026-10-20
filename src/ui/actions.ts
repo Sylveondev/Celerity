@@ -8,6 +8,9 @@ import {
 } from '../core/timeline';
 import { applyCTFill, applyCTStroke, cloneElements, concatCT, defaultColorEffect, effectToTransform, isIdentityCT, uid, uniqueName, baseName } from '../core/util';
 import { forEachElement, makeInstance } from '../core/store';
+import { keyAllProps, clearKeysAt } from '../core/motion';
+import { attachSound } from './audio';
+import { placeVideo } from './video';
 import { getSymbol, instanceFrame, layoutText } from '../core/symbols';
 import { store, ui, setUI } from './state';
 import { toast } from './dom';
@@ -25,7 +28,7 @@ function referencedItems(els: Element[]): LibraryItem[] {
   const visit = (list: Element[]) => {
     for (const e of list) {
       if (e.type === 'group') visit(e.children);
-      else if ((e.type === 'symbol' || e.type === 'bitmap') && !names.has(e.libraryItem)) {
+      else if ((e.type === 'symbol' || e.type === 'bitmap' || e.type === 'video') && !names.has(e.libraryItem)) {
         names.add(e.libraryItem);
         const it = store.lib.get(e.libraryItem);
         if (it?.kind === 'symbol') {
@@ -81,7 +84,11 @@ export function paste(inPlace: boolean, text?: string | null, center?: { x: numb
     dx = center.x - (c.bounds.x + c.bounds.w / 2);
     dy = center.y - (c.bounds.y + c.bounds.h / 2);
   }
-  for (const e of els) e.matrix = { ...e.matrix, tx: e.matrix.tx + dx, ty: e.matrix.ty + dy };
+  for (const e of els) {
+    e.matrix = { ...e.matrix, tx: e.matrix.tx + dx, ty: e.matrix.ty + dy };
+    // raw shape pieces float above the layer until deselected
+    if (e.type === 'shape' && e.planar) { e.lifted = true; e.floating = true; }
+  }
   const ids = els.map((e) => e.id);
   store.transact('Paste', () => {
     for (const it of c!.library) {
@@ -89,6 +96,9 @@ export function paste(inPlace: boolean, text?: string | null, center?: { x: numb
     }
     const list = store.editableElements(layer);
     list?.push(...els);
+    // select inside the transaction so pasted raw pieces stay floating
+    store.selection = [...ids];
+    store.subSel.clear();
   });
   store.select(ids);
 }
@@ -112,9 +122,12 @@ export function duplicateSelection() {
     for (const s of store.mutableSelection()) {
       const c = cloneElements([s.el])[0];
       c.matrix = { ...c.matrix, tx: c.matrix.tx + 10, ty: c.matrix.ty + 10 };
+      if (c.type === 'shape' && c.planar) { c.lifted = true; c.floating = true; }
       s.list.splice(s.list.indexOf(s.el) + 1, 0, c);
       ids.push(c.id);
     }
+    store.selection = [...ids];
+    store.subSel.clear();
   });
   store.select(ids);
 }
@@ -263,7 +276,8 @@ export function groupSelection() {
     const ms = store.mutableSelection();
     const target = ms.find((s) => s.layer.id === layerId) ?? ms[ms.length - 1];
     const idx = target.list.indexOf(target.el);
-    const children = ms.map((s) => s.el);
+    // lifted raw-shape parts become the group's own raw shape
+    const children = ms.map((s) => (s.el.type === 'shape' && s.el.lifted ? { ...s.el, lifted: undefined, floating: undefined, id: uid() } : s.el));
     const g: Element = { type: 'group', id: uid(), matrix: identity(), children };
     gid = g.id;
     let insertAt = idx;
@@ -334,8 +348,13 @@ export function breakApart() {
           }
         });
         parts = letters;
+      } else if (el.type === 'shape' && !el.planar) {
+        // drawing object -> raw (merge) shape
+        const paths = el.paths.map((p) => ({ ...p, d: transformPath(p.d, el.matrix), fill: p.fill && p.fill.kind !== 'solid' ? { ...p.fill, matrix: multiply(el.matrix, p.fill.matrix) } : p.fill }));
+        const planar = planarFromPaths(paths);
+        parts = [{ type: 'shape', id: uid(), matrix: identity(), planar, paths: planarToPaths(planar) }];
       } else {
-        if (!warned) { store.flash('Bitmaps and drawing objects cannot be broken apart further.'); warned = true; }
+        if (!warned && el.type === 'bitmap') { store.flash('Bitmaps cannot be broken apart.'); warned = true; }
         continue;
       }
       if (!parts) continue;
@@ -381,6 +400,7 @@ export function unionShapes() {
 }
 
 import { transformPath } from '../core/path';
+import { planarFromPaths, planarToPaths } from '../core/planar';
 function transformPathM(d: number[], m: Matrix) { return transformPath(d, m); }
 
 // ---------------- symbols ----------------
@@ -421,6 +441,12 @@ export function placeLibraryItem(name: string, x: number, y: number) {
       inst.transformPoint = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
     }
     el = inst;
+  } else if (it.kind === 'sound') {
+    attachSound(name);
+    return;
+  } else if (it.kind === 'video') {
+    placeVideo(name, x, y);
+    return;
   } else {
     el = { type: 'bitmap', id: uid(), matrix: translate(Math.round(x - it.width / 2), Math.round(y - it.height / 2)), libraryItem: name };
   }
@@ -439,7 +465,7 @@ export function swapSymbol(instanceId: string, newName: string) {
 
 export function symbolUsage(name: string): number {
   let n = 0;
-  forEachElement(store.doc, (e) => { if ((e.type === 'symbol' || e.type === 'bitmap') && e.libraryItem === name) n++; });
+  forEachElement(store.doc, (e) => { if ((e.type === 'symbol' || e.type === 'bitmap' || e.type === 'video') && e.libraryItem === name) n++; });
   return n;
 }
 
@@ -479,6 +505,15 @@ export function insertKeyframeCmd(blank: boolean) {
   if (!layers.length) return;
   const first = layers[0];
   const wasKey = f1 === f0 && !!first && f0 < layerLength(first) && frameAt(first, f0)?.start === f0;
+  // F6 inside a motion tween adds property keyframes instead of splitting the span
+  if (!blank && f1 === f0) {
+    const fr = layers.length === 1 ? frameAt(layers[0], f0) : null;
+    if (fr && fr.tween === 'motion' && fr.motion && f0 > fr.start) {
+      store.transact('Insert Keyframe', () => keyAllProps(fr, f0 - fr.start));
+      store.emit('timeline');
+      return;
+    }
+  }
   store.transact(blank ? 'Insert Blank Keyframe' : 'Insert Keyframe', () => {
     for (const l of layers) {
       if (f1 > f0) convertToKeyframes(l, f0, f1, blank);
@@ -497,40 +532,65 @@ export function insertKeyframeCmd(blank: boolean) {
 export function clearKeyframeCmd() {
   const { layers, f0, f1 } = frameTargets();
   if (!layers.length) return;
+  const fr = layers.length === 1 && f0 === f1 ? frameAt(layers[0], f0) : null;
+  if (fr && fr.tween === 'motion' && fr.motion && f0 > fr.start) {
+    store.transact('Clear Keyframe', () => { clearKeysAt(fr, f0 - fr.start); });
+    return;
+  }
   store.transact('Clear Keyframe', () => { for (const l of layers) clearKeyframes(l, f0, f1); });
+}
+
+/** Animate converts non-symbol tween content into a symbol (classic: "Tween N" graphic; motion: "Symbol N" movie clip). */
+function spanToSymbol(fr: Frame, base: string, type: SymbolType) {
+  if (!fr.elements.length) return;
+  if (fr.elements.length === 1 && fr.elements[0].type === 'symbol') return;
+  if (base.startsWith('Tween') && fr.elements.every((e) => e.type === 'symbol')) return;
+  if (fr.elements.length === 1 && fr.elements[0].type !== 'symbol' && fr.elements[0].type !== 'shape' && fr.elements[0].type !== 'group' && base.startsWith('Tween')) return;
+  const name = uniqueName(store.libraryNames(), `${base} 1`);
+  const b = elementsBounds(fr.elements, I, store.lib);
+  const ox = isEmptyRect(b) ? 0 : b.x, oy = isEmptyRect(b) ? 0 : b.y;
+  const els = fr.elements.map((e) => {
+    const c = { ...e, matrix: multiply(translate(-ox, -oy), e.matrix) };
+    if (c.type === 'shape') { delete c.lifted; delete c.floating; }
+    return c;
+  });
+  const sym = {
+    kind: 'symbol' as const, name, symbolType: type, itemID: `${Date.now().toString(16)}-${Math.floor(Math.random() * 1e8).toString(16)}`,
+    timeline: { name, layers: [{ id: uid(), name: 'Layer_1', type: 'normal' as const, parentId: null, visible: true, locked: false, outline: false, color: '#4F80FF', frames: [{ start: 0, duration: 1, elements: els, tween: 'none' as const, ease: 0, rotate: 'auto' as const, rotateTimes: 0, label: '', labelType: 'name' as const, script: '' }] }] },
+  };
+  store.addLibraryItem(sym);
+  const inst: SymbolInstance = makeInstance(name, type, translate(ox, oy));
+  if (!isEmptyRect(b)) inst.transformPoint = { x: b.w / 2, y: b.h / 2 };
+  fr.elements = [inst];
 }
 
 export function createTween(kind: Frame['tween']) {
   const { layers, f0, f1 } = frameTargets();
   if (!layers.length) return;
-  store.transact(kind === 'classic' ? 'Create Classic Tween' : kind === 'shape' ? 'Create Shape Tween' : 'Remove Tween', () => {
+  const label = kind === 'classic' ? 'Create Classic Tween' : kind === 'shape' ? 'Create Shape Tween' : kind === 'motion' ? 'Create Motion Tween' : 'Remove Tween';
+  let empty = false;
+  store.transact(label, () => {
     for (const l of layers) {
       if (kind === 'classic') {
-        // Animate converts non-symbol content into "Tween N" graphic symbols
         const spans = new Set<Frame>();
         for (let f = f0; f <= f1; f++) {
           const fr = frameAt(l, f);
           if (fr) { spans.add(fr); const i = l.frames.indexOf(fr); if (l.frames[i + 1]) spans.add(l.frames[i + 1]); }
         }
-        for (const fr of spans) {
-          if (!fr.elements.length || fr.elements.every((e) => e.type === 'symbol')) continue;
-          if (fr.elements.length === 1 && fr.elements[0].type !== 'symbol' && fr.elements[0].type !== 'shape' && fr.elements[0].type !== 'group') continue;
-          const name = uniqueName(store.libraryNames(), 'Tween 1');
-          const b = elementsBounds(fr.elements, I, store.lib);
-          const ox = isEmptyRect(b) ? 0 : b.x, oy = isEmptyRect(b) ? 0 : b.y;
-          const sym = {
-            kind: 'symbol' as const, name, symbolType: 'graphic' as const, itemID: `${Date.now().toString(16)}-${Math.floor(Math.random() * 1e8).toString(16)}`,
-            timeline: { name, layers: [{ id: uid(), name: 'Layer_1', type: 'normal' as const, parentId: null, visible: true, locked: false, outline: false, color: '#4F80FF', frames: [{ start: 0, duration: 1, elements: fr.elements.map((e) => ({ ...e, matrix: multiply(translate(-ox, -oy), e.matrix) })), tween: 'none' as const, ease: 0, rotate: 'auto' as const, rotateTimes: 0, label: '', labelType: 'name' as const, script: '' }] }] },
-          };
-          store.addLibraryItem(sym);
-          const inst: SymbolInstance = makeInstance(name, 'graphic', translate(ox, oy));
-          if (!isEmptyRect(b)) inst.transformPoint = { x: b.w / 2, y: b.h / 2 };
-          fr.elements = [inst];
-        }
+        for (const fr of spans) spanToSymbol(fr, 'Tween', 'graphic');
+      } else if (kind === 'motion') {
+        const fr = frameAt(l, f0);
+        if (!fr || !fr.elements.length) { empty = true; continue; }
+        spanToSymbol(fr, 'Symbol', 'movieclip');
+        // a one-frame span grows to one second, like Animate
+        if (fr.duration === 1) insertFrames(l, fr.start, Math.max(1, Math.round(store.doc.fps) - 1));
+        setTween(l, fr.start, fr.start, 'motion');
+        continue;
       }
       setTween(l, f0, f1, kind);
     }
   });
+  if (empty) store.flash('Select a frame with an object to create a motion tween.');
 }
 
 export function setFrameProps(fn: (f: Frame) => void, label = 'Frame Properties') {

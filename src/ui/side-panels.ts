@@ -1,3 +1,4 @@
+import { mapShapeStyles } from '../core/merge';
 // Color, Align and Transform panels.
 import { store, ui, setUI, onUI } from './state';
 import { h, clear, numField, checkbox, select } from './dom';
@@ -81,8 +82,9 @@ export class ColorPanel {
     store.transact(this.target === 'fill' ? 'Fill Color' : 'Stroke Color', () => {
       for (const s of store.mutableSelection()) {
         if (s.el.type !== 'shape') continue;
-        s.el.paths = s.el.paths.map((p) => {
+        mapShapeStyles(s.el, (p) => {
           if (this.target === 'stroke') {
+            if (s.el.type === 'shape' && s.el.planar && !p.stroke) return p;
             return { ...p, stroke: ui.strokeNone ? null : { ...(p.stroke ?? { width: ui.strokeWidth, caps: ui.caps, joints: ui.joints }), color: ui.strokeColor, alpha: ui.strokeAlpha } };
           }
           if (!p.fill && !ui.fillNone) return p;
@@ -91,7 +93,7 @@ export class ColorPanel {
           if (!f) return p;
           if (f.kind !== 'solid' && p.fill && p.fill.kind === f.kind) return { ...p, fill: { ...f, matrix: p.fill.matrix } };
           return { ...p, fill: f.kind === 'solid' ? f : fitGradient(f, pathBounds(p.d)) };
-        }).filter((p) => p.fill || p.stroke);
+        });
       }
     });
   }

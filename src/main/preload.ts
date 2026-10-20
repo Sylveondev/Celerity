@@ -19,6 +19,9 @@ contextBridge.exposeInMainWorld('celerityNative', {
   openExternal: (url: string) => ipcRenderer.invoke('app:openExternal', url),
   showItem: (p: string) => ipcRenderer.invoke('app:showItem', p),
   info: () => ipcRenderer.invoke('app:info'),
+  media: {
+    transcode: (data: Uint8Array, target: string) => ipcRenderer.invoke('media:transcode', data, target),
+  },
   video: {
     probe: () => ipcRenderer.invoke('video:probe'),
     start: (o: unknown) => ipcRenderer.invoke('video:start', o),

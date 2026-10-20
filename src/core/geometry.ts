@@ -35,6 +35,8 @@ export function elementBounds(el: Element, m: Matrix, lib: LibIndex, fctx: Frame
       const lay = layoutText(el);
       return transformRect(mm, { x: 0, y: 0, w: lay.width, h: lay.height });
     }
+    case 'video':
+      return transformRect(mm, { x: 0, y: 0, w: el.width, h: el.height });
   }
 }
 
@@ -119,6 +121,10 @@ export function hitElement(el: Element, m: Matrix, x: number, y: number, lib: Li
       const lay = layoutText(el);
       const p = apply(invert(mm), x, y);
       return p.x >= 0 && p.y >= 0 && p.x <= lay.width && p.y <= lay.height;
+    }
+    case 'video': {
+      const p = apply(invert(mm), x, y);
+      return p.x >= 0 && p.y >= 0 && p.x <= el.width && p.y <= el.height;
     }
   }
 }

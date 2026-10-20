@@ -2,6 +2,8 @@
 import type { Frame, Layer, Timeline } from '../core/types';
 import { frameAt, layerLength, timelineFrameCount, moveFrames } from '../core/timeline';
 import { classicTweenValid, shapeTweenValid } from '../core/tween';
+import { motionKeyOffsets } from '../core/motion';
+import { audio } from './audio';
 import { store, ui, setUI, onUI } from './state';
 import { h, clear, numField } from './dom';
 import { icon } from './icons';
@@ -485,8 +487,9 @@ export class TimelinePanel {
 
   frameMenu(): MenuItem[] {
     return [
-      { label: 'Create Classic Tween', action: () => A.createTween('classic') },
+      { label: 'Create Motion Tween', action: () => A.createTween('motion') },
       { label: 'Create Shape Tween', action: () => A.createTween('shape') },
+      { label: 'Create Classic Tween', action: () => A.createTween('classic') },
       { label: 'Remove Tween', action: () => A.createTween('none') },
       SEP,
       { label: 'Insert Frame', shortcut: 'F5', action: () => A.insertFrame() },
@@ -614,6 +617,7 @@ export class TimelinePanel {
     let bg = empty ? '#363636' : '#5b5b5b';
     if (fr.tween === 'classic') bg = '#5a4a86';
     else if (fr.tween === 'shape') bg = '#3f6b45';
+    else if (fr.tween === 'motion') bg = '#3b6d96';
     ctx.fillStyle = bg;
     ctx.fillRect(x0, y + 1, x1 - x0, ROW_H - 2);
     // frame dividers inside span for readability when wide
@@ -626,7 +630,15 @@ export class TimelinePanel {
     ctx.strokeStyle = '#1e1e1e';
     ctx.strokeRect(x0 + 0.5, y + 1.5, x1 - x0 - 1, ROW_H - 3);
     // tween arrow / broken tween
-    if (fr.tween !== 'none' && b > a) {
+    if (fr.tween === 'motion' && fr.motion) {
+      // property keyframes: small diamonds
+      ctx.fillStyle = '#101010';
+      for (const k of motionKeyOffsets(fr.motion)) {
+        if (k <= 0 || k > b - a) continue;
+        const kx = (a + k) * cw - sx + cw / 2, ky = y + ROW_H - 7;
+        ctx.beginPath(); ctx.moveTo(kx, ky - 3.5); ctx.lineTo(kx + 3.5, ky); ctx.lineTo(kx, ky + 3.5); ctx.lineTo(kx - 3.5, ky); ctx.closePath(); ctx.fill();
+      }
+    } else if (fr.tween !== 'none' && b > a) {
       const valid = fr.tween === 'classic' ? classicTweenValid(fr, next) : shapeTweenValid(fr, next);
       ctx.strokeStyle = valid ? '#e8e8e8' : '#e8e8e8';
       ctx.setLineDash(valid ? [] : [3, 3]);
@@ -638,6 +650,29 @@ export class TimelinePanel {
       if (valid) {
         ctx.beginPath(); ctx.moveTo(x1 - 4, my); ctx.lineTo(x1 - 8, my - 3); ctx.lineTo(x1 - 8, my + 3); ctx.closePath();
         ctx.fillStyle = '#e8e8e8'; ctx.fill();
+      }
+    }
+    // sound waveform across the frames the sound lasts
+    if (fr.sound) {
+      const it = store.lib.get(fr.sound.name);
+      if (it && it.kind === 'sound') {
+        const dur = audio.durationOf(it);
+        const frames = dur * store.doc.fps;
+        const pk = audio.peaksOf(it, 4096);
+        if (pk && frames > 0) {
+          const wEnd = fr.sound.sync === 'stream' || fr.sound.loopMode === 'loop' ? x1 : Math.min(x1, x0 + frames * cw * Math.max(1, fr.sound.loops || 1));
+          const mid = y + ROW_H / 2;
+          ctx.save();
+          ctx.beginPath(); ctx.rect(x0, y + 1, Math.max(0, wEnd - x0), ROW_H - 2); ctx.clip();
+          ctx.fillStyle = 'rgba(140,200,255,0.75)';
+          const pxPerFrame = cw;
+          for (let px = 0; px < wEnd - x0; px++) {
+            const tf = (px / pxPerFrame) % frames;
+            const v = pk[Math.min(pk.length - 1, Math.floor((tf / frames) * pk.length))] * (ROW_H / 2 - 3);
+            ctx.fillRect(x0 + px, mid - v, 1, Math.max(1, v * 2));
+          }
+          ctx.restore();
+        } else if (!pk) audio.onDecodedOnce(() => this.request());
       }
     }
     // keyframe dot

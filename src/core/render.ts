@@ -19,6 +19,8 @@ export interface RenderEnv {
   showGuides: boolean;    // render guide layers
   outlines: boolean;      // honour per-layer outline mode
   authoring?: boolean;    // stage editing: masks only apply when mask + masked layers are locked (like Animate)
+  /** Decoded frame of a library video `offset` timeline frames into its keyframe span (null = not ready). */
+  videoFrame?: (item: string, offset: number) => CanvasImageSource | null;
 }
 
 export const ROOT_CONTEXT: FrameContext = { offset: 0, elapsed: 0, spanAll: true, playback: false };
@@ -284,6 +286,33 @@ export function renderElement(
       ctx.fillStyle = rgba(c, a);
       for (const line of lay.lines) ctx.fillText(line.text, line.x, line.y + el.size * 0.1);
       try { (ctx as any).letterSpacing = '0px'; } catch { /* ignore */ }
+      break;
+    }
+    case 'video': {
+      setCtx(ctx, m);
+      const w = el.width, hh = el.height;
+      if (outline) { ctx.strokeStyle = outline; ctx.lineWidth = 1 / scaleFactor(m); ctx.strokeRect(0, 0, w, hh); break; }
+      if (forceFill) { ctx.fillStyle = forceFill; ctx.fillRect(0, 0, w, hh); break; }
+      const img = env.videoFrame?.(el.libraryItem, fctx.offset) ?? null;
+      if (!img) {
+        // not decoded (yet): a film-strip placeholder
+        ctx.fillStyle = 'rgba(40,40,40,0.85)';
+        ctx.fillRect(0, 0, w, hh);
+        ctx.strokeStyle = 'rgba(200,200,200,0.6)';
+        ctx.lineWidth = 1 / scaleFactor(m);
+        ctx.strokeRect(0, 0, w, hh);
+        ctx.fillStyle = 'rgba(220,220,220,0.8)';
+        const s = Math.min(w, hh) * 0.18;
+        ctx.beginPath(); ctx.moveTo(w / 2 - s * 0.6, hh / 2 - s); ctx.lineTo(w / 2 + s, hh / 2); ctx.lineTo(w / 2 - s * 0.6, hh / 2 + s); ctx.closePath(); ctx.fill();
+        break;
+      }
+      if (isIdentityCT(ct)) ctx.drawImage(img, 0, 0, w, hh);
+      else if (isAlphaOnlyCT(ct)) {
+        const ga = ctx.globalAlpha;
+        ctx.globalAlpha = ga * Math.max(0, Math.min(1, ct.am));
+        ctx.drawImage(img, 0, 0, w, hh);
+        ctx.globalAlpha = ga;
+      } else ctx.drawImage(colorTransformedImage(img as CanvasImageSource & { width: number; height: number }, ct) as CanvasImageSource, 0, 0, w, hh);
       break;
     }
   }

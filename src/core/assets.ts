@@ -37,6 +37,13 @@ export class AssetStore {
     return asset;
   }
 
+  /** Adds bytes that need no image decoding (sounds, video). */
+  addRaw(bytes: Uint8Array, mime: string, id?: string): Asset {
+    const asset: Asset = { id: id ?? `a${Date.now().toString(36)}${(n++).toString(36)}`, mime, bytes, width: 0, height: 0, image: null };
+    this.map.set(asset.id, asset);
+    return asset;
+  }
+
   /** Copies an asset from another store under a new id. */
   adopt(a: Asset): Asset {
     const copy: Asset = { ...a, id: `a${Date.now().toString(36)}${(n++).toString(36)}` };
